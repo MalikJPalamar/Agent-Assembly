@@ -39,39 +39,32 @@ Centaurion Framework
 - **Outer Shield:** Ed25519 key pair, ZK proofs, temporal attestation chain
 - **Inner Channel:** Shared Generative Model, mutual prediction error exchange, Coupling Strength Index, consent-gated model evolution
 
-## Development Methodology
+## Development
 
-Autoresearch loop adapted from [karpathy/autoresearch](https://github.com/karpathy/autoresearch):
-
-```
-Hypothesis → Experiment → Measure → Keep or Discard → Repeat
-```
-
-**Composite Score** = 0.40 x Prediction Accuracy + 0.30 x User Satisfaction + 0.30 x System Efficiency
-
-See [program.md](program.md) for full methodology.
+See [program.md](program.md) for full autoresearch methodology.
+See [../mission-control/](../mission-control/) for the orchestration dashboard.
 
 ## Milestones
 
 | Milestone | Target | Focus |
 |-----------|--------|-------|
-| M0: Foundation | Apr 20, 2026 | Supabase schema, Terra sandbox, static dashboard |
-| M1: Prototype | May 9, 2026 | Real wearable data flowing, basic coaching |
-| M2: Intelligence | Jun 13, 2026 | Cognitive Component L1-L2, baseline model |
-| M3: Bond | Jul 18, 2026 | Symbiotic Engine Ed25519 + SGM |
-| M4: AOB Integration | Aug 22, 2026 | Facilitator dashboard, student journey |
-| M5: Autoresearch | Sep 2026+ | Self-improving methodology loop |
+| M0 | Apr 20, 2026 | Supabase schema, Terra sandbox |
+| M1 | May 9, 2026 | Real wearable data, basic coaching |
+| M2 | Jun 13, 2026 | Cognitive Component L1-L2 |
+| M3 | Jul 18, 2026 | Symbiotic Engine Ed25519 + SGM |
+| M4 | Aug 22, 2026 | Facilitator dashboard, student journey |
+| M5 | Sep 2026+ | Self-improving methodology loop |
 
 ## Tech Stack
 
 - **Data:** Supabase (PostgreSQL + RLS + Edge Functions + Vault)
 - **On-device AI:** Gemma 4 E2B/E4B via Google AI Edge SDK
 - **Cloud reasoning:** Claude API
-- **Wearables:** Terra API (unified: Whoop, Oura, Apple Health, Garmin)
-- **Crypto:** Ed25519 (Web Crypto API), zk-SNARKs (snarkjs), Merkle trees
+- **Wearables:** Terra API (unified)
+- **Crypto:** Ed25519, zk-SNARKs, Merkle trees
 - **Frontend:** React
-- **Infrastructure:** Hostinger VPS, GitHub Actions
+- **Infra:** Hostinger VPS, GitHub Actions
 
 ---
 
-Built by [Malik Palamar](https://centaurion.me) · Fractional CEO · BuilderBee x AOB x Centaurion
+Built by [Malik Palamar](https://centaurion.me) | BuilderBee x AOB x Centaurion
