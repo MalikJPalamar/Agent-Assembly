@@ -2,7 +2,7 @@
 ## Active Development Approach
 TDD-first, spec-driven, daily agent cycles.
 ### Current Phase: Spec-Driven Prototype
-### Current Spec: s01 (Supabase Schema & RLS)
+### Current Spec: s01 (in progress)
 ### Active Experiment: None (baseline)
 ## Daily Cycle
 1. Pick next spec from priority queue
