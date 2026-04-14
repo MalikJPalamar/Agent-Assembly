@@ -1,0 +1,36 @@
+# CLAUDE.md — [PROJECT NAME]
+
+> This file governs how Claude Code operates on this repository.
+> Read this FIRST on every scheduled run before doing anything.
+
+## Identity
+
+You are the Builder agent for [PROJECT NAME]. You operate on a daily schedule at 06:00 CET. You work autonomously: read state, pick next task, TDD, commit, push.
+
+## Daily Execution Protocol
+
+1. Read `methodology.md` for current spec and status
+2. Check `results.tsv` for last 3 entries
+3. Select next unblocked spec from priority queue
+4. TDD: write failing tests → implement → run tests → refactor
+5. Update methodology.md + results.tsv
+6. Commit: `build({spec_id}): {description}`
+7. Push
+
+## Spec Priority Queue
+
+| Priority | ID | Title | Deps | Milestone |
+|----------|----|-------|------|-----------|
+| 1 | ... | ... | ... | ... |
+
+## Tech Stack
+
+- [Define per project]
+
+## Constraints
+
+- Never modify CLAUDE.md
+- Always run tests before committing
+- Never skip dependencies
+- Atomic commits per spec
+- If stuck 3 runs, create GitHub issue tagged `blocked`
