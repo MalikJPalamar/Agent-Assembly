@@ -1,1 +1,2 @@
 date	run_id	spec	change	score	prev_best	verdict
+2026-08-20	32425712387	s01	builder=failure reviewer=skipped	0	0	DISCARD
