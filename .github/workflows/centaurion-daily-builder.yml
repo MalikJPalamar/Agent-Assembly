@@ -2,8 +2,8 @@ name: Centaurion Daily Builder
 
 on:
   schedule:
-    # 07:00 UTC = 09:00 CET daily (weekdays)
-    - cron: '0 7 * * 1-5'
+    # 02:00 UTC nightly, every day (one experiment per run)
+    - cron: '0 2 * * *'
   workflow_dispatch:
     inputs:
       spec_override:
@@ -25,9 +25,15 @@ permissions:
   issues: write
   pull-requests: write
 
+# One experiment at a time: never let two runs race on main / results.tsv.
+concurrency:
+  group: software-factory
+  cancel-in-progress: false
+
 env:
   FRAMEWORK_DIR: centaurion-framework
   BUILDER_MODEL: claude-sonnet-5
+  MAX_FILES_PER_RUN: 25
 
 jobs:
   architect:
@@ -90,6 +96,10 @@ jobs:
     if: github.event.inputs.mode != 'report'
     outputs:
       summary: ${{ steps.generate.outputs.summary }}
+      learned: ${{ steps.generate.outputs.learned }}
+      next: ${{ steps.generate.outputs.next }}
+      spec_complete: ${{ steps.generate.outputs.spec_complete }}
+      files_changed: ${{ steps.commit.outputs.files_changed }}
     steps:
       - uses: actions/checkout@v5
 
@@ -133,15 +143,28 @@ jobs:
             PKG_NOTE="There is NO package.json yet. You MUST create package.json at the repo-relative path 'package.json' with {\"name\":\"centaurion-framework\",\"private\":true,\"scripts\":{\"test\":\"jest\"},\"devDependencies\":{\"jest\":\"^29.7.0\"}} and nothing that needs network access at test time."
           fi
           EXISTING=$(cd "$FRAMEWORK_DIR" && { find src tests -type f 2>/dev/null || true; } | sort | head -200)
+          HISTORY=$(tail -n 20 "$FRAMEWORK_DIR/results.tsv")
+          PREV_BEST=$(bash .github/scripts/prev-best.sh "$FRAMEWORK_DIR/results.tsv" "$SPEC_ID")
+          LEARNED=$(sed -n '/^## Learned \/ Next/,$p' "$FRAMEWORK_DIR/methodology.md" | tail -n 40)
 
           cat > "$WORK/prompt.txt" <<EOF
           You are the Builder agent for the Centaurion Framework, working in the directory
           '$FRAMEWORK_DIR/' of a git repository. All paths you output are relative to that directory.
 
-          ## Your task: implement spec $SPEC_ID - $SPEC_TITLE
-          Follow TDD: write jest tests in tests/$SPEC_ID.test.js that fully cover the spec,
-          then the implementation under src/$SPEC_ID/ so the tests pass. CommonJS modules,
-          Node 20, jest 29, no network access, no runtime dependencies beyond Node built-ins.
+          ## This is ONE experiment in a nightly keep/discard loop
+          Propose ONE bounded change that moves spec $SPEC_ID - $SPEC_TITLE forward.
+          Your run is scored by the number of passing jest tests; it is KEPT (merged) only if
+          zero tests fail AND the score beats the previous best for this spec ($PREV_BEST).
+          So: add or complete acceptance tests in tests/$SPEC_ID.test.js and make them pass with
+          code under src/$SPEC_ID/. Never delete or weaken existing tests. Keep the change small
+          (max $MAX_FILES_PER_RUN files). CommonJS, Node 20, jest 29, no network access, no
+          runtime dependencies beyond Node built-ins.
+
+          ## Recent experiment history (results.tsv, newest last)
+          $HISTORY
+
+          ## What previous runs learned (methodology.md)
+          ${LEARNED:-<none yet>}
 
           ## Spec
           $SPEC_TEXT
@@ -157,7 +180,12 @@ jobs:
 
           ## Output format - STRICT
           Respond with ONLY a single JSON object, no markdown fences, no prose before or after:
-          {"files":[{"path":"tests/$SPEC_ID.test.js","content":"..."},{"path":"src/$SPEC_ID/index.js","content":"..."}],"summary":"one sentence, <=120 chars, describing what was built"}
+          {"files":[{"path":"tests/$SPEC_ID.test.js","content":"..."},{"path":"src/$SPEC_ID/index.js","content":"..."}],
+           "summary":"one sentence, <=120 chars, describing this change",
+           "learned":"one sentence: what this run taught about the spec or codebase",
+           "next":"one sentence: what the next run should try",
+           "spec_complete":false}
+          Set spec_complete to true ONLY when every acceptance criterion of the spec is implemented and tested.
           Paths must be relative, must not contain '..', and must not start with '/' or '.github/'.
           EOF
 
@@ -190,7 +218,15 @@ jobs:
           bash .github/scripts/apply-builder-output.sh "$WORK/model.txt" "$FRAMEWORK_DIR" "$WORK/summary.txt"
 
           SUMMARY=$(tr '\t\r\n' '   ' < "$WORK/summary.txt" | cut -c1-200)
-          echo "summary=$SUMMARY" >> "$GITHUB_OUTPUT"
+          LEARNED_OUT=$(jq -r '.learned // ""' "$WORK/model.txt" | tr '\t\r\n' '   ' | cut -c1-300)
+          NEXT_OUT=$(jq -r '.next // ""' "$WORK/model.txt" | tr '\t\r\n' '   ' | cut -c1-300)
+          SPEC_COMPLETE=$(jq -r '.spec_complete == true' "$WORK/model.txt")
+          {
+            echo "summary=$SUMMARY"
+            echo "learned=$LEARNED_OUT"
+            echo "next=$NEXT_OUT"
+            echo "spec_complete=$SPEC_COMPLETE"
+          } >> "$GITHUB_OUTPUT"
           {
             echo "## Builder"
             echo "- **Model:** $BUILDER_MODEL (stop_reason: $STOP)"
@@ -200,6 +236,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Commit builder output
+        id: commit
         env:
           SPEC_ID: ${{ needs.architect.outputs.current_spec }}
           BUILD_BRANCH: ${{ needs.architect.outputs.build_branch }}
@@ -213,14 +250,23 @@ jobs:
             echo "::error::Builder produced no file changes"
             exit 1
           fi
+          FILES=$(git diff --staged --name-only | wc -l | tr -d ' ')
+          echo "files_changed=$FILES" >> "$GITHUB_OUTPUT"
+          if git diff --staged --name-only | grep -q '^\.github/'; then
+            echo "::error::Builder touched .github/ - refusing to commit"; exit 1
+          fi
           git commit -m "builder: $SPEC_ID - $SUMMARY"
           git push origin "$BUILD_BRANCH"
 
   reviewer:
-    name: "Reviewer - Test & Validate"
+    name: "Reviewer - Measure"
     needs: [architect, builder]
     runs-on: ubuntu-latest
     if: github.event.inputs.mode != 'report'
+    outputs:
+      score: ${{ steps.measure.outputs.score }}
+      tests_passed: ${{ steps.measure.outputs.tests_passed }}
+      tests_failed: ${{ steps.measure.outputs.tests_failed }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -231,29 +277,35 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install and run tests
-        working-directory: ${{ env.FRAMEWORK_DIR }}
+      - name: Run tests and compute score
+        id: measure
         run: |
           set -euo pipefail
+          cd "$FRAMEWORK_DIR"
           if [ ! -f package.json ]; then
             echo "::error::package.json missing on build branch - Builder must create it"
-            exit 1
+            echo "score=0" >> "$GITHUB_OUTPUT"; echo "tests_passed=0" >> "$GITHUB_OUTPUT"; echo "tests_failed=1" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           if [ -f package-lock.json ]; then npm ci; else npm install --no-audit --no-fund; fi
+          # A failing test suite is a DISCARD, not a broken pipeline: never fail this job on red tests.
           set +e
-          npm test -- --ci 2>&1 | tee /tmp/test-results.txt
-          STATUS=${PIPESTATUS[0]}
+          npx jest --ci --json --outputFile=/tmp/jest.json 2>&1 | tee /tmp/test-results.txt
           set -e
+          cd "$GITHUB_WORKSPACE"
+          bash .github/scripts/score.sh /tmp/jest.json | tee -a "$GITHUB_OUTPUT"
           {
-            echo "## Reviewer Results (exit $STATUS)"
+            echo "## Reviewer - Measure"
             echo '```'
+            bash .github/scripts/score.sh /tmp/jest.json
+            echo '```'
+            echo "<details><summary>jest output</summary>"; echo; echo '```'
             tail -80 /tmp/test-results.txt
-            echo '```'
+            echo '```'; echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
-          exit "$STATUS"
 
   reporter:
-    name: "Reporter - Push & Update"
+    name: "Reporter - Keep or Discard"
     needs: [architect, builder, reviewer]
     if: always() && needs.architect.result == 'success'
     runs-on: ubuntu-latest
@@ -264,65 +316,100 @@ jobs:
       BUILDER_RESULT: ${{ needs.builder.result }}
       REVIEWER_RESULT: ${{ needs.reviewer.result }}
       SUMMARY: ${{ needs.builder.outputs.summary }}
+      LEARNED: ${{ needs.builder.outputs.learned }}
+      NEXT: ${{ needs.builder.outputs.next }}
+      SPEC_COMPLETE: ${{ needs.builder.outputs.spec_complete }}
+      FILES_CHANGED: ${{ needs.builder.outputs.files_changed }}
+      SCORE: ${{ needs.reviewer.outputs.score }}
+      TESTS_FAILED: ${{ needs.reviewer.outputs.tests_failed }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v5
         with:
           ref: main
+          fetch-depth: 0
 
-      - name: Open PR (pass) or delete build branch (fail)
-        id: pr
-        run: |
-          set -euo pipefail
-          if [ "$REVIEWER_RESULT" = "success" ]; then
-            URL=$(gh pr create --base main --head "$BUILD_BRANCH" \
-              --title "build($SPEC_ID): ${SUMMARY:-$SPEC_TITLE}" \
-              --body "$(printf 'Automated build of spec **%s** (%s).\n\nSummary: %s\n\nReviewer: tests passed in run %s.\n\nhttps://github.com/%s/actions/runs/%s' "$SPEC_ID" "$SPEC_TITLE" "${SUMMARY:-n/a}" "${{ github.run_id }}" "${{ github.repository }}" "${{ github.run_id }}")")
-            echo "pr_url=$URL" >> "$GITHUB_OUTPUT"
-            echo "pr_number=${URL##*/}" >> "$GITHUB_OUTPUT"
-            echo "Opened $URL"
-          else
-            if git ls-remote --exit-code --heads origin "$BUILD_BRANCH" >/dev/null 2>&1; then
-              git push origin --delete "$BUILD_BRANCH"
-              echo "Deleted failed build branch $BUILD_BRANCH"
-            fi
-          fi
-
-      - name: Update results.tsv and spec queue
-        env:
-          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
-        run: |
-          set -euo pipefail
-          DATE=$(date +%Y-%m-%d)
-          if [ "$REVIEWER_RESULT" = "success" ]; then STATUS=pass; else STATUS=fail; fi
-          NOTE="builder=$BUILDER_RESULT reviewer=$REVIEWER_RESULT"
-          [ -n "$PR_NUMBER" ] && NOTE="$NOTE PR #$PR_NUMBER"
-          [ -n "$SUMMARY" ] && NOTE="$NOTE - $SUMMARY"
-          printf '%s\t%s\t%s\t--\t--\t%s\n' "$DATE" "$SPEC_ID" "$STATUS" "$NOTE" >> "$FRAMEWORK_DIR/results.tsv"
-          if [ -n "$PR_NUMBER" ]; then
-            awk -F'\t' -v OFS='\t' -v id="$SPEC_ID" -v pr="$PR_NUMBER" \
-              '$1==id && $3=="todo" {$3="built (PR #" pr ")"} {print}' \
-              "$FRAMEWORK_DIR/specs/queue.tsv" > /tmp/queue.tsv
-            mv /tmp/queue.tsv "$FRAMEWORK_DIR/specs/queue.tsv"
-          fi
-
-      - name: Commit and push report
+      - name: Decide KEEP or DISCARD
+        id: decide
         run: |
           set -euo pipefail
           git config user.name "Centaurion Reporter Agent"
           git config user.email "reporter@centaurion.me"
-          git add "$FRAMEWORK_DIR/results.tsv" "$FRAMEWORK_DIR/specs/queue.tsv"
-          git diff --staged --quiet && { echo "Nothing to report"; exit 0; }
-          git commit -m "report: $SPEC_ID $(date +%Y-%m-%d)"
-          git pull --rebase origin main
-          git push origin HEAD:main
+          PREV_BEST=$(bash .github/scripts/prev-best.sh "$FRAMEWORK_DIR/results.tsv" "$SPEC_ID")
+          if [ "$BUILDER_RESULT" != "success" ] || [ "$REVIEWER_RESULT" != "success" ]; then
+            VERDICT=DISCARD; SCORE=0; TESTS_FAILED=1
+            echo "Pipeline stage failed (builder=$BUILDER_RESULT reviewer=$REVIEWER_RESULT) -> DISCARD"
+          else
+            VERDICT=$(bash .github/scripts/decide.sh "${SCORE:-0}" "$PREV_BEST" "${TESTS_FAILED:-1}" "${FILES_CHANGED:-0}" "$MAX_FILES_PER_RUN")
+          fi
+          {
+            echo "verdict=$VERDICT"
+            echo "prev_best=$PREV_BEST"
+            echo "score=${SCORE:-0}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: KEEP - merge build branch into main
+        if: steps.decide.outputs.verdict == 'KEEP'
+        run: |
+          set -euo pipefail
+          git fetch origin "$BUILD_BRANCH"
+          # Final safety net: the build branch must not touch .github/ and must respect the file cap.
+          if git diff --name-only "origin/main...origin/$BUILD_BRANCH" | grep -q '^\.github/'; then
+            echo "::error::Build branch modifies .github/ - refusing to merge"; exit 1
+          fi
+          N=$(git diff --name-only "origin/main...origin/$BUILD_BRANCH" | wc -l | tr -d ' ')
+          if [ "$N" -gt "$MAX_FILES_PER_RUN" ]; then
+            echo "::error::Build branch changes $N files (> $MAX_FILES_PER_RUN) - refusing to merge"; exit 1
+          fi
+          git merge --no-ff "origin/$BUILD_BRANCH" -m "keep($SPEC_ID): $SUMMARY [score ${{ steps.decide.outputs.score }} > ${{ steps.decide.outputs.prev_best }}]"
+          # Learned / Next goes into the evolving program.
+          {
+            echo "- **${{ github.run_id }} / $SPEC_ID / score ${{ steps.decide.outputs.score }}** - ${SUMMARY:-n/a}"
+            [ -n "$LEARNED" ] && echo "  - learned: $LEARNED"
+            [ -n "$NEXT" ] && echo "  - next: $NEXT"
+          } >> "$FRAMEWORK_DIR/methodology.md"
+          if [ "$SPEC_COMPLETE" = "true" ]; then
+            awk -F'\t' -v OFS='\t' -v id="$SPEC_ID" -v run="${{ github.run_id }}" \
+              '$1==id && $3=="todo" {$3="done (run " run ")"} {print}' \
+              "$FRAMEWORK_DIR/specs/queue.tsv" > /tmp/queue.tsv
+            mv /tmp/queue.tsv "$FRAMEWORK_DIR/specs/queue.tsv"
+            echo "Spec $SPEC_ID marked done"
+          fi
+
+      - name: DISCARD - delete build branch
+        if: steps.decide.outputs.verdict != 'KEEP'
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin "$BUILD_BRANCH" >/dev/null 2>&1; then
+            git push origin --delete "$BUILD_BRANCH"
+            echo "Deleted discarded build branch $BUILD_BRANCH"
+          fi
+
+      - name: Log experiment and push main
+        run: |
+          set -euo pipefail
+          CHANGE=$(printf '%s' "${SUMMARY:-builder=$BUILDER_RESULT reviewer=$REVIEWER_RESULT}" | tr '\t\r\n' '   ')
+          printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$(date -u +%Y-%m-%d)" "${{ github.run_id }}" "$SPEC_ID" "$CHANGE" \
+            "${{ steps.decide.outputs.score }}" "${{ steps.decide.outputs.prev_best }}" "${{ steps.decide.outputs.verdict }}" \
+            >> "$FRAMEWORK_DIR/results.tsv"
+          git add "$FRAMEWORK_DIR/results.tsv" "$FRAMEWORK_DIR/methodology.md" "$FRAMEWORK_DIR/specs/queue.tsv"
+          git commit -m "log($SPEC_ID): ${{ steps.decide.outputs.verdict }} run ${{ github.run_id }} score ${{ steps.decide.outputs.score }}" || true
+          # Push the merge (if KEEP) + the log row together; rebase only the log commit if main moved.
+          for attempt in 1 2 3; do
+            git push origin HEAD:main && exit 0
+            echo "push attempt $attempt failed, rebasing"; git pull --rebase origin main || true
+          done
+          echo "::error::Could not push to main after 3 attempts"; exit 1
 
       - name: Post summary
         run: |
           {
-            echo "## Daily Report - $(date +%Y-%m-%d)"
+            echo "## Experiment ${{ github.run_id }} - $(date -u +%Y-%m-%d)"
             echo "- **Spec:** $SPEC_ID - $SPEC_TITLE"
-            echo "- **Builder:** $BUILDER_RESULT"
-            echo "- **Reviewer:** $REVIEWER_RESULT"
-            echo "- **PR:** ${{ steps.pr.outputs.pr_url || 'none (build branch deleted)' }}"
+            echo "- **Change:** ${SUMMARY:-n/a}"
+            echo "- **Score:** ${{ steps.decide.outputs.score }} (prev best ${{ steps.decide.outputs.prev_best }})"
+            echo "- **Verdict:** ${{ steps.decide.outputs.verdict }}"
+            [ -n "$LEARNED" ] && echo "- **Learned:** $LEARNED"
+            [ -n "$NEXT" ] && echo "- **Next:** $NEXT"
           } >> "$GITHUB_STEP_SUMMARY"
