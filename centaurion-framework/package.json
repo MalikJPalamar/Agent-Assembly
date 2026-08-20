@@ -1,0 +1,11 @@
+{
+  "name": "centaurion-framework",
+  "private": true,
+  "scripts": {
+    "test": "jest"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  }
+}
+
