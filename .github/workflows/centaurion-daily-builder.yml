@@ -190,7 +190,7 @@ jobs:
           EOF
 
           jq -n --arg model "$BUILDER_MODEL" --rawfile prompt "$WORK/prompt.txt" \
-            '{model:$model, max_tokens:16000, temperature:0,
+            '{model:$model, max_tokens:16000,
               system:"You output only valid JSON. Never wrap it in code fences.",
               messages:[{role:"user",content:$prompt}]}' > "$WORK/request.json"
 
