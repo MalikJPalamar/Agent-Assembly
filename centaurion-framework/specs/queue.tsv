@@ -1,0 +1,6 @@
+id	title	status	milestone
+s01	Supabase schema (users, sessions, biomarker_readings)	todo	M0
+s02	Terra wearable sandbox client	todo	M0
+s03	Basic coaching rules engine	todo	M1
+s04	Cognitive Component L1 (baseline state model)	todo	M2
+s05	Symbiotic Engine Ed25519 identity	todo	M3

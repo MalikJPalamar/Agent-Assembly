@@ -23,11 +23,11 @@ on:
 permissions:
   contents: write
   issues: write
+  pull-requests: write
 
 env:
-  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-  SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+  FRAMEWORK_DIR: centaurion-framework
+  BUILDER_MODEL: claude-sonnet-5
 
 jobs:
   architect:
@@ -43,37 +43,53 @@ jobs:
 
       - name: Select next spec from priority queue
         id: select
+        env:
+          OVERRIDE: ${{ github.event.inputs.spec_override }}
         run: |
-          # Read methodology.md to find current spec
-          # If override provided, use that
-          if [ -n "${{ github.event.inputs.spec_override }}" ]; then
-            echo "spec_id=${{ github.event.inputs.spec_override }}" >> $GITHUB_OUTPUT
-            echo "spec_title=Override: ${{ github.event.inputs.spec_override }}" >> $GITHUB_OUTPUT
-            echo "spec_phase=manual" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          QUEUE="$FRAMEWORK_DIR/specs/queue.tsv"
+          if [ -n "$OVERRIDE" ]; then
+            SPEC_ID="$OVERRIDE"
+            PHASE=manual
           else
-            # Parse methodology.md for current spec
-            CURRENT=$(grep "Current Spec:" centaurion-framework/methodology.md | sed 's/.*: //' | tr -d '()')
-            SPEC_ID=$(echo "$CURRENT" | awk '{print $1}')
-            echo "spec_id=${SPEC_ID:-s01}" >> $GITHUB_OUTPUT
-            echo "spec_title=${CURRENT:-s01 Supabase Schema}" >> $GITHUB_OUTPUT
-            echo "spec_phase=auto" >> $GITHUB_OUTPUT
+            # Rule: first row whose status is exactly "todo". Deterministic and advances
+            # automatically once the Reporter marks a row "built (PR #n)".
+            SPEC_ID=$(awk -F'\t' 'NR>1 && $3=="todo" {print $1; exit}' "$QUEUE")
+            PHASE=auto
           fi
-          # Single source of truth for the builder branch name (shared with reviewer)
-          SPEC=$(grep '^spec_id=' $GITHUB_OUTPUT | tail -1 | cut -d= -f2)
-          echo "build_branch=builder/${SPEC}-$(date +%Y%m%d)-${{ github.run_id }}" >> $GITHUB_OUTPUT
+          if [ -z "$SPEC_ID" ]; then
+            echo "::error::No spec with status 'todo' left in $QUEUE - nothing to build"
+            exit 1
+          fi
+          TITLE=$(awk -F'\t' -v id="$SPEC_ID" '$1==id {print $2; exit}' "$QUEUE")
+          if [ -z "$TITLE" ]; then
+            echo "::error::Spec '$SPEC_ID' not found in $QUEUE"
+            exit 1
+          fi
+          {
+            echo "spec_id=$SPEC_ID"
+            echo "spec_title=$TITLE"
+            echo "spec_phase=$PHASE"
+            echo "build_branch=builder/${SPEC_ID}-$(date +%Y%m%d)-${{ github.run_id }}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Log architect decision
         run: |
-          echo "## Architect Decision" >> $GITHUB_STEP_SUMMARY
-          echo "- **Spec:** ${{ steps.select.outputs.spec_id }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Title:** ${{ steps.select.outputs.spec_title }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Mode:** ${{ github.event.inputs.mode || 'build' }}" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Architect Decision"
+            echo "- **Spec:** ${{ steps.select.outputs.spec_id }}"
+            echo "- **Title:** ${{ steps.select.outputs.spec_title }}"
+            echo "- **Selection:** ${{ steps.select.outputs.spec_phase }}"
+            echo "- **Mode:** ${{ github.event.inputs.mode || 'build' }}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   builder:
     name: "Builder - TDD Implementation"
     needs: architect
     runs-on: ubuntu-latest
     if: github.event.inputs.mode != 'report'
+    outputs:
+      summary: ${{ steps.generate.outputs.summary }}
     steps:
       - uses: actions/checkout@v5
 
@@ -82,67 +98,122 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Read spec and generate implementation
+      - name: Generate implementation with Claude
+        id: generate
         env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           SPEC_ID: ${{ needs.architect.outputs.current_spec }}
+          SPEC_TITLE: ${{ needs.architect.outputs.spec_title }}
           BUILD_BRANCH: ${{ needs.architect.outputs.build_branch }}
         run: |
+          set -euo pipefail
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::ANTHROPIC_API_KEY secret is not set. Run: gh secret set ANTHROPIC_API_KEY -R ${{ github.repository }}"
+            exit 1
+          fi
           echo "Building spec: $SPEC_ID on $BUILD_BRANCH"
-
-          # Create working branch
           git checkout -b "$BUILD_BRANCH"
 
-          if [ -z "$ANTHROPIC_API_KEY" ]; then
-            echo "::warning::ANTHROPIC_API_KEY secret is not set - Builder will only write stub files. Set it with: gh secret set ANTHROPIC_API_KEY"
+          WORK=$(mktemp -d)
+          SPEC_FILE="$FRAMEWORK_DIR/specs/$SPEC_ID.md"
+          if [ -f "$SPEC_FILE" ]; then
+            SPEC_TEXT=$(cat "$SPEC_FILE")
+          else
+            echo "::warning::$SPEC_FILE not found - building from queue title only"
+            SPEC_TEXT="# $SPEC_ID - $SPEC_TITLE
+
+          No detailed spec file exists. Implement a minimal, well-tested first slice of
+          this deliverable under src/$SPEC_ID/ with tests in tests/$SPEC_ID.test.js."
+          fi
+          PROGRAM_TEXT=$(head -120 "$FRAMEWORK_DIR/program.md")
+          if [ -f "$FRAMEWORK_DIR/package.json" ]; then
+            PKG_NOTE="A package.json already exists (shown below); do NOT overwrite it unless you must add a devDependency.
+          $(cat "$FRAMEWORK_DIR/package.json")"
+          else
+            PKG_NOTE="There is NO package.json yet. You MUST create package.json at the repo-relative path 'package.json' with {\"name\":\"centaurion-framework\",\"private\":true,\"scripts\":{\"test\":\"jest\"},\"devDependencies\":{\"jest\":\"^29.7.0\"}} and nothing that needs network access at test time."
+          fi
+          EXISTING=$(cd "$FRAMEWORK_DIR" && { find src tests -type f 2>/dev/null || true; } | sort | head -200)
+
+          cat > "$WORK/prompt.txt" <<EOF
+          You are the Builder agent for the Centaurion Framework, working in the directory
+          '$FRAMEWORK_DIR/' of a git repository. All paths you output are relative to that directory.
+
+          ## Your task: implement spec $SPEC_ID - $SPEC_TITLE
+          Follow TDD: write jest tests in tests/$SPEC_ID.test.js that fully cover the spec,
+          then the implementation under src/$SPEC_ID/ so the tests pass. CommonJS modules,
+          Node 20, jest 29, no network access, no runtime dependencies beyond Node built-ins.
+
+          ## Spec
+          $SPEC_TEXT
+
+          ## Packaging
+          $PKG_NOTE
+
+          ## Existing files under src/ and tests/ (do not delete; you may add or overwrite)
+          ${EXISTING:-<none>}
+
+          ## Program context (excerpt)
+          $PROGRAM_TEXT
+
+          ## Output format - STRICT
+          Respond with ONLY a single JSON object, no markdown fences, no prose before or after:
+          {"files":[{"path":"tests/$SPEC_ID.test.js","content":"..."},{"path":"src/$SPEC_ID/index.js","content":"..."}],"summary":"one sentence, <=120 chars, describing what was built"}
+          Paths must be relative, must not contain '..', and must not start with '/' or '.github/'.
+          EOF
+
+          jq -n --arg model "$BUILDER_MODEL" --rawfile prompt "$WORK/prompt.txt" \
+            '{model:$model, max_tokens:16000, temperature:0,
+              system:"You output only valid JSON. Never wrap it in code fences.",
+              messages:[{role:"user",content:$prompt}]}' > "$WORK/request.json"
+
+          echo "Calling Anthropic Messages API ($BUILDER_MODEL)..."
+          if ! curl -sS --fail-with-body --max-time 900 https://api.anthropic.com/v1/messages \
+              -H "content-type: application/json" \
+              -H "x-api-key: $ANTHROPIC_API_KEY" \
+              -H "anthropic-version: 2023-06-01" \
+              -d @"$WORK/request.json" -o "$WORK/response.json"; then
+            echo "::error::Anthropic API request failed"
+            echo "--- response body ---"; cat "$WORK/response.json" || true; echo
+            exit 1
           fi
 
-          # Call Claude API to generate tests + implementation
-          SPEC_FILE="centaurion-framework/specs"
-          PROMPT="You are the Builder agent for the Centaurion Framework.
-          Current spec: $SPEC_ID
-          Read the program.md for context. Generate:
-          1. A test file at tests/${SPEC_ID}.test.js with failing tests
-          2. Implementation code at src/${SPEC_ID}/ to make tests pass
-          3. Updated methodology.md with current spec status
-          Follow TDD: tests first, then minimal implementation.
-          Output as JSON with keys: test_file, impl_files (array), methodology_update"
+          STOP=$(jq -r '.stop_reason // "unknown"' "$WORK/response.json")
+          echo "stop_reason=$STOP  usage=$(jq -c '.usage' "$WORK/response.json")"
+          if [ "$STOP" = "max_tokens" ]; then
+            echo "::error::Response truncated (stop_reason=max_tokens); output would be invalid JSON"
+            exit 1
+          fi
 
-          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
-            -H "Content-Type: application/json" \
-            -H "x-api-key: $ANTHROPIC_API_KEY" \
-            -H "anthropic-version: 2023-06-01" \
-            -d "{
-              \"model\": \"claude-sonnet-4-20250514\",
-              \"max_tokens\": 8000,
-              \"messages\": [{
-                \"role\": \"user\",
-                \"content\": \"$(cat centaurion-framework/program.md | head -100 | tr '\n' ' ' | sed 's/"/\\"/g')\n\n$PROMPT\"
-              }]
-            }")
+          # Concatenate text blocks, strip optional ```json fences, then parse.
+          jq -r '[.content[] | select(.type=="text") | .text] | join("")' "$WORK/response.json" \
+            | sed -e '1{/^```[a-zA-Z]*$/d;}' -e '${/^```$/d;}' > "$WORK/model.txt"
+          bash .github/scripts/apply-builder-output.sh "$WORK/model.txt" "$FRAMEWORK_DIR" "$WORK/summary.txt"
 
-          # Save response for reviewer
-          echo "$RESPONSE" > /tmp/builder-output.json
-
-          # Extract and write files (simplified - real impl parses JSON)
-          mkdir -p centaurion-framework/src/$SPEC_ID
-          mkdir -p centaurion-framework/tests
-
-          echo "// Generated by Builder agent $(date -u +%Y-%m-%dT%H:%M:%SZ)" > centaurion-framework/tests/${SPEC_ID}.test.js
-          echo "// Spec: $SPEC_ID" >> centaurion-framework/tests/${SPEC_ID}.test.js
-          echo "// TODO: Claude API response parsed and written here" >> centaurion-framework/tests/${SPEC_ID}.test.js
-
-          echo "// Generated by Builder agent $(date -u +%Y-%m-%dT%H:%M:%SZ)" > centaurion-framework/src/${SPEC_ID}/index.js
-          echo "// Implementation for spec: $SPEC_ID" >> centaurion-framework/src/${SPEC_ID}/index.js
+          SUMMARY=$(tr '\t\r\n' '   ' < "$WORK/summary.txt" | cut -c1-200)
+          echo "summary=$SUMMARY" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Builder"
+            echo "- **Model:** $BUILDER_MODEL (stop_reason: $STOP)"
+            echo "- **Summary:** $SUMMARY"
+            echo "- **Files:**"
+            git status --porcelain | sed 's/^/    /'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Commit builder output
         env:
           SPEC_ID: ${{ needs.architect.outputs.current_spec }}
           BUILD_BRANCH: ${{ needs.architect.outputs.build_branch }}
+          SUMMARY: ${{ steps.generate.outputs.summary }}
         run: |
+          set -euo pipefail
           git config user.name "Centaurion Builder Agent"
           git config user.email "builder@centaurion.me"
           git add -A
-          git commit -m "builder: $SPEC_ID - TDD cycle $(date +%Y-%m-%d)" || echo "No changes"
+          if git diff --staged --quiet; then
+            echo "::error::Builder produced no file changes"
+            exit 1
+          fi
+          git commit -m "builder: $SPEC_ID - $SUMMARY"
           git push origin "$BUILD_BRANCH"
 
   reviewer:
@@ -160,54 +231,98 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Run tests
+      - name: Install and run tests
+        working-directory: ${{ env.FRAMEWORK_DIR }}
         run: |
-          cd centaurion-framework
-          # Install dependencies if package.json exists
-          [ -f package.json ] && npm ci || echo "No package.json yet"
-          # Run tests
-          npx jest tests/ --passWithNoTests 2>&1 | tee /tmp/test-results.txt || true
-
-      - name: Log review results
-        run: |
-          echo "## Reviewer Results" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cat /tmp/test-results.txt >> $GITHUB_STEP_SUMMARY || echo "No test output"
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          set -euo pipefail
+          if [ ! -f package.json ]; then
+            echo "::error::package.json missing on build branch - Builder must create it"
+            exit 1
+          fi
+          if [ -f package-lock.json ]; then npm ci; else npm install --no-audit --no-fund; fi
+          set +e
+          npm test -- --ci 2>&1 | tee /tmp/test-results.txt
+          STATUS=${PIPESTATUS[0]}
+          set -e
+          {
+            echo "## Reviewer Results (exit $STATUS)"
+            echo '```'
+            tail -80 /tmp/test-results.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$STATUS"
 
   reporter:
     name: "Reporter - Push & Update"
     needs: [architect, builder, reviewer]
-    if: always()
+    if: always() && needs.architect.result == 'success'
     runs-on: ubuntu-latest
+    env:
+      SPEC_ID: ${{ needs.architect.outputs.current_spec }}
+      SPEC_TITLE: ${{ needs.architect.outputs.spec_title }}
+      BUILD_BRANCH: ${{ needs.architect.outputs.build_branch }}
+      BUILDER_RESULT: ${{ needs.builder.result }}
+      REVIEWER_RESULT: ${{ needs.reviewer.result }}
+      SUMMARY: ${{ needs.builder.outputs.summary }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: main
 
-      - name: Update results.tsv
-        env:
-          SPEC_ID: ${{ needs.architect.outputs.current_spec }}
+      - name: Open PR (pass) or delete build branch (fail)
+        id: pr
         run: |
+          set -euo pipefail
+          if [ "$REVIEWER_RESULT" = "success" ]; then
+            URL=$(gh pr create --base main --head "$BUILD_BRANCH" \
+              --title "build($SPEC_ID): ${SUMMARY:-$SPEC_TITLE}" \
+              --body "$(printf 'Automated build of spec **%s** (%s).\n\nSummary: %s\n\nReviewer: tests passed in run %s.\n\nhttps://github.com/%s/actions/runs/%s' "$SPEC_ID" "$SPEC_TITLE" "${SUMMARY:-n/a}" "${{ github.run_id }}" "${{ github.repository }}" "${{ github.run_id }}")")
+            echo "pr_url=$URL" >> "$GITHUB_OUTPUT"
+            echo "pr_number=${URL##*/}" >> "$GITHUB_OUTPUT"
+            echo "Opened $URL"
+          else
+            if git ls-remote --exit-code --heads origin "$BUILD_BRANCH" >/dev/null 2>&1; then
+              git push origin --delete "$BUILD_BRANCH"
+              echo "Deleted failed build branch $BUILD_BRANCH"
+            fi
+          fi
+
+      - name: Update results.tsv and spec queue
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
           DATE=$(date +%Y-%m-%d)
-          printf '%s\t%s\tbuilding\t--\t--\tDaily automated cycle\n' "$DATE" "$SPEC_ID" >> centaurion-framework/results.tsv
-
-      - name: Update methodology.md with progress
-        env:
-          SPEC_ID: ${{ needs.architect.outputs.current_spec }}
-        run: |
-          sed -i "s/### Current Spec:.*/### Current Spec: $SPEC_ID (in progress)/" centaurion-framework/methodology.md
+          if [ "$REVIEWER_RESULT" = "success" ]; then STATUS=pass; else STATUS=fail; fi
+          NOTE="builder=$BUILDER_RESULT reviewer=$REVIEWER_RESULT"
+          [ -n "$PR_NUMBER" ] && NOTE="$NOTE PR #$PR_NUMBER"
+          [ -n "$SUMMARY" ] && NOTE="$NOTE - $SUMMARY"
+          printf '%s\t%s\t%s\t--\t--\t%s\n' "$DATE" "$SPEC_ID" "$STATUS" "$NOTE" >> "$FRAMEWORK_DIR/results.tsv"
+          if [ -n "$PR_NUMBER" ]; then
+            awk -F'\t' -v OFS='\t' -v id="$SPEC_ID" -v pr="$PR_NUMBER" \
+              '$1==id && $3=="todo" {$3="built (PR #" pr ")"} {print}' \
+              "$FRAMEWORK_DIR/specs/queue.tsv" > /tmp/queue.tsv
+            mv /tmp/queue.tsv "$FRAMEWORK_DIR/specs/queue.tsv"
+          fi
 
       - name: Commit and push report
         run: |
+          set -euo pipefail
           git config user.name "Centaurion Reporter Agent"
           git config user.email "reporter@centaurion.me"
-          git add -A
-          git diff --staged --quiet || git commit -m "report: daily progress $(date +%Y-%m-%d)"
-          git push || echo "Nothing to push"
+          git add "$FRAMEWORK_DIR/results.tsv" "$FRAMEWORK_DIR/specs/queue.tsv"
+          git diff --staged --quiet && { echo "Nothing to report"; exit 0; }
+          git commit -m "report: $SPEC_ID $(date +%Y-%m-%d)"
+          git pull --rebase origin main
+          git push origin HEAD:main
 
       - name: Post summary
         run: |
-          echo "## Daily Report - $(date +%Y-%m-%d)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Spec:** ${{ needs.architect.outputs.current_spec }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Builder:** ${{ needs.builder.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Reviewer:** ${{ needs.reviewer.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Next action:** Check results.tsv for score tracking" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Daily Report - $(date +%Y-%m-%d)"
+            echo "- **Spec:** $SPEC_ID - $SPEC_TITLE"
+            echo "- **Builder:** $BUILDER_RESULT"
+            echo "- **Reviewer:** $REVIEWER_RESULT"
+            echo "- **PR:** ${{ steps.pr.outputs.pr_url || 'none (build branch deleted)' }}"
+          } >> "$GITHUB_STEP_SUMMARY"
