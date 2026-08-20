@@ -2,8 +2,8 @@ name: Centaurion Daily Builder
 
 on:
   schedule:
-    # 07:00 UTC = 09:00 CET daily (weekdays)
-    - cron: '0 7 * * 1-5'
+    # 02:00 UTC nightly, every day (one experiment per run)
+    - cron: '0 2 * * *'
   workflow_dispatch:
     inputs:
       spec_override:
@@ -23,11 +23,17 @@ on:
 permissions:
   contents: write
   issues: write
+  pull-requests: write
+
+# One experiment at a time: never let two runs race on main / results.tsv.
+concurrency:
+  group: software-factory
+  cancel-in-progress: false
 
 env:
-  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-  SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+  FRAMEWORK_DIR: centaurion-framework
+  BUILDER_MODEL: claude-sonnet-5
+  MAX_FILES_PER_RUN: 25
 
 jobs:
   architect:
@@ -37,167 +43,373 @@ jobs:
       current_spec: ${{ steps.select.outputs.spec_id }}
       spec_title: ${{ steps.select.outputs.spec_title }}
       spec_phase: ${{ steps.select.outputs.spec_phase }}
+      build_branch: ${{ steps.select.outputs.build_branch }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Select next spec from priority queue
         id: select
+        env:
+          OVERRIDE: ${{ github.event.inputs.spec_override }}
         run: |
-          # Read methodology.md to find current spec
-          # If override provided, use that
-          if [ -n "${{ github.event.inputs.spec_override }}" ]; then
-            echo "spec_id=${{ github.event.inputs.spec_override }}" >> $GITHUB_OUTPUT
-            echo "spec_title=Override: ${{ github.event.inputs.spec_override }}" >> $GITHUB_OUTPUT
-            echo "spec_phase=manual" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          QUEUE="$FRAMEWORK_DIR/specs/queue.tsv"
+          if [ -n "$OVERRIDE" ]; then
+            SPEC_ID="$OVERRIDE"
+            PHASE=manual
           else
-            # Parse methodology.md for current spec
-            CURRENT=$(grep "Current Spec:" centaurion-framework/methodology.md | sed 's/.*: //' | tr -d '()')
-            SPEC_ID=$(echo "$CURRENT" | awk '{print $1}')
-            echo "spec_id=${SPEC_ID:-s01}" >> $GITHUB_OUTPUT
-            echo "spec_title=${CURRENT:-s01 Supabase Schema}" >> $GITHUB_OUTPUT
-            echo "spec_phase=auto" >> $GITHUB_OUTPUT
+            # Rule: first row whose status is exactly "todo". Deterministic and advances
+            # automatically once the Reporter marks a row "built (PR #n)".
+            SPEC_ID=$(awk -F'\t' 'NR>1 && $3=="todo" {print $1; exit}' "$QUEUE")
+            PHASE=auto
           fi
+          if [ -z "$SPEC_ID" ]; then
+            echo "::error::No spec with status 'todo' left in $QUEUE - nothing to build"
+            exit 1
+          fi
+          TITLE=$(awk -F'\t' -v id="$SPEC_ID" '$1==id {print $2; exit}' "$QUEUE")
+          if [ -z "$TITLE" ]; then
+            echo "::error::Spec '$SPEC_ID' not found in $QUEUE"
+            exit 1
+          fi
+          {
+            echo "spec_id=$SPEC_ID"
+            echo "spec_title=$TITLE"
+            echo "spec_phase=$PHASE"
+            echo "build_branch=builder/${SPEC_ID}-$(date +%Y%m%d)-${{ github.run_id }}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Log architect decision
         run: |
-          echo "## Architect Decision" >> $GITHUB_STEP_SUMMARY
-          echo "- **Spec:** ${{ steps.select.outputs.spec_id }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Title:** ${{ steps.select.outputs.spec_title }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Mode:** ${{ github.event.inputs.mode || 'build' }}" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Architect Decision"
+            echo "- **Spec:** ${{ steps.select.outputs.spec_id }}"
+            echo "- **Title:** ${{ steps.select.outputs.spec_title }}"
+            echo "- **Selection:** ${{ steps.select.outputs.spec_phase }}"
+            echo "- **Mode:** ${{ github.event.inputs.mode || 'build' }}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   builder:
     name: "Builder - TDD Implementation"
     needs: architect
     runs-on: ubuntu-latest
     if: github.event.inputs.mode != 'report'
+    outputs:
+      summary: ${{ steps.generate.outputs.summary }}
+      learned: ${{ steps.generate.outputs.learned }}
+      next: ${{ steps.generate.outputs.next }}
+      spec_complete: ${{ steps.generate.outputs.spec_complete }}
+      files_changed: ${{ steps.commit.outputs.files_changed }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '20'
 
-      - name: Read spec and generate implementation
+      - name: Generate implementation with Claude
+        id: generate
         env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           SPEC_ID: ${{ needs.architect.outputs.current_spec }}
+          SPEC_TITLE: ${{ needs.architect.outputs.spec_title }}
+          BUILD_BRANCH: ${{ needs.architect.outputs.build_branch }}
         run: |
-          echo "Building spec: $SPEC_ID"
+          set -euo pipefail
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::ANTHROPIC_API_KEY secret is not set. Run: gh secret set ANTHROPIC_API_KEY -R ${{ github.repository }}"
+            exit 1
+          fi
+          echo "Building spec: $SPEC_ID on $BUILD_BRANCH"
+          git checkout -b "$BUILD_BRANCH"
 
-          # Create working branch
-          git checkout -b builder/$SPEC_ID-$(date +%Y%m%d)
+          WORK=$(mktemp -d)
+          SPEC_FILE="$FRAMEWORK_DIR/specs/$SPEC_ID.md"
+          if [ -f "$SPEC_FILE" ]; then
+            SPEC_TEXT=$(cat "$SPEC_FILE")
+          else
+            echo "::warning::$SPEC_FILE not found - building from queue title only"
+            SPEC_TEXT="# $SPEC_ID - $SPEC_TITLE
 
-          # Call Claude API to generate tests + implementation
-          SPEC_FILE="centaurion-framework/specs"
-          PROMPT="You are the Builder agent for the Centaurion Framework.
-          Current spec: $SPEC_ID
-          Read the program.md for context. Generate:
-          1. A test file at tests/${SPEC_ID}.test.js with failing tests
-          2. Implementation code at src/${SPEC_ID}/ to make tests pass
-          3. Updated methodology.md with current spec status
-          Follow TDD: tests first, then minimal implementation.
-          Output as JSON with keys: test_file, impl_files (array), methodology_update"
+          No detailed spec file exists. Implement a minimal, well-tested first slice of
+          this deliverable under src/$SPEC_ID/ with tests in tests/$SPEC_ID.test.js."
+          fi
+          PROGRAM_TEXT=$(head -120 "$FRAMEWORK_DIR/program.md")
+          if [ -f "$FRAMEWORK_DIR/package.json" ]; then
+            PKG_NOTE="A package.json already exists (shown below); do NOT overwrite it unless you must add a devDependency.
+          $(cat "$FRAMEWORK_DIR/package.json")"
+          else
+            PKG_NOTE="There is NO package.json yet. You MUST create package.json at the repo-relative path 'package.json' with {\"name\":\"centaurion-framework\",\"private\":true,\"scripts\":{\"test\":\"jest\"},\"devDependencies\":{\"jest\":\"^29.7.0\"}} and nothing that needs network access at test time."
+          fi
+          EXISTING=$(cd "$FRAMEWORK_DIR" && { find src tests -type f 2>/dev/null || true; } | sort | head -200)
+          HISTORY=$(tail -n 20 "$FRAMEWORK_DIR/results.tsv")
+          PREV_BEST=$(bash .github/scripts/prev-best.sh "$FRAMEWORK_DIR/results.tsv" "$SPEC_ID")
+          LEARNED=$(sed -n '/^## Learned \/ Next/,$p' "$FRAMEWORK_DIR/methodology.md" | tail -n 40)
 
-          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
-            -H "Content-Type: application/json" \
-            -H "x-api-key: $ANTHROPIC_API_KEY" \
-            -H "anthropic-version: 2023-06-01" \
-            -d "{
-              \"model\": \"claude-sonnet-4-20250514\",
-              \"max_tokens\": 8000,
-              \"messages\": [{
-                \"role\": \"user\",
-                \"content\": \"$(cat centaurion-framework/program.md | head -100 | tr '\n' ' ' | sed 's/"/\\"/g')\n\n$PROMPT\"
-              }]
-            }")
+          cat > "$WORK/prompt.txt" <<EOF
+          You are the Builder agent for the Centaurion Framework, working in the directory
+          '$FRAMEWORK_DIR/' of a git repository. All paths you output are relative to that directory.
 
-          # Save response for reviewer
-          echo "$RESPONSE" > /tmp/builder-output.json
+          ## This is ONE experiment in a nightly keep/discard loop
+          Propose ONE bounded change that moves spec $SPEC_ID - $SPEC_TITLE forward.
+          Your run is scored by the number of passing jest tests; it is KEPT (merged) only if
+          zero tests fail AND the score beats the previous best for this spec ($PREV_BEST).
+          So: add or complete acceptance tests in tests/$SPEC_ID.test.js and make them pass with
+          code under src/$SPEC_ID/. Never delete or weaken existing tests. Keep the change small
+          (max $MAX_FILES_PER_RUN files). CommonJS, Node 20, jest 29, no network access, no
+          runtime dependencies beyond Node built-ins.
 
-          # Extract and write files (simplified - real impl parses JSON)
-          mkdir -p centaurion-framework/src/$SPEC_ID
-          mkdir -p centaurion-framework/tests
+          ## Recent experiment history (results.tsv, newest last)
+          $HISTORY
 
-          echo "// Generated by Builder agent $(date -u +%Y-%m-%dT%H:%M:%SZ)" > centaurion-framework/tests/${SPEC_ID}.test.js
-          echo "// Spec: $SPEC_ID" >> centaurion-framework/tests/${SPEC_ID}.test.js
-          echo "// TODO: Claude API response parsed and written here" >> centaurion-framework/tests/${SPEC_ID}.test.js
+          ## What previous runs learned (methodology.md)
+          ${LEARNED:-<none yet>}
 
-          echo "// Generated by Builder agent $(date -u +%Y-%m-%dT%H:%M:%SZ)" > centaurion-framework/src/${SPEC_ID}/index.js
-          echo "// Implementation for spec: $SPEC_ID" >> centaurion-framework/src/${SPEC_ID}/index.js
+          ## Spec
+          $SPEC_TEXT
+
+          ## Packaging
+          $PKG_NOTE
+
+          ## Existing files under src/ and tests/ (do not delete; you may add or overwrite)
+          ${EXISTING:-<none>}
+
+          ## Program context (excerpt)
+          $PROGRAM_TEXT
+
+          ## Output format - STRICT
+          Respond with ONLY a single JSON object, no markdown fences, no prose before or after:
+          {"files":[{"path":"tests/$SPEC_ID.test.js","content":"..."},{"path":"src/$SPEC_ID/index.js","content":"..."}],
+           "summary":"one sentence, <=120 chars, describing this change",
+           "learned":"one sentence: what this run taught about the spec or codebase",
+           "next":"one sentence: what the next run should try",
+           "spec_complete":false}
+          Set spec_complete to true ONLY when every acceptance criterion of the spec is implemented and tested.
+          Paths must be relative, must not contain '..', and must not start with '/' or '.github/'.
+          EOF
+
+          jq -n --arg model "$BUILDER_MODEL" --rawfile prompt "$WORK/prompt.txt" \
+            '{model:$model, max_tokens:16000, temperature:0,
+              system:"You output only valid JSON. Never wrap it in code fences.",
+              messages:[{role:"user",content:$prompt}]}' > "$WORK/request.json"
+
+          echo "Calling Anthropic Messages API ($BUILDER_MODEL)..."
+          if ! curl -sS --fail-with-body --max-time 900 https://api.anthropic.com/v1/messages \
+              -H "content-type: application/json" \
+              -H "x-api-key: $ANTHROPIC_API_KEY" \
+              -H "anthropic-version: 2023-06-01" \
+              -d @"$WORK/request.json" -o "$WORK/response.json"; then
+            echo "::error::Anthropic API request failed"
+            echo "--- response body ---"; cat "$WORK/response.json" || true; echo
+            exit 1
+          fi
+
+          STOP=$(jq -r '.stop_reason // "unknown"' "$WORK/response.json")
+          echo "stop_reason=$STOP  usage=$(jq -c '.usage' "$WORK/response.json")"
+          if [ "$STOP" = "max_tokens" ]; then
+            echo "::error::Response truncated (stop_reason=max_tokens); output would be invalid JSON"
+            exit 1
+          fi
+
+          # Concatenate text blocks, strip optional ```json fences, then parse.
+          jq -r '[.content[] | select(.type=="text") | .text] | join("")' "$WORK/response.json" \
+            | sed -e '1{/^```[a-zA-Z]*$/d;}' -e '${/^```$/d;}' > "$WORK/model.txt"
+          bash .github/scripts/apply-builder-output.sh "$WORK/model.txt" "$FRAMEWORK_DIR" "$WORK/summary.txt"
+
+          SUMMARY=$(tr '\t\r\n' '   ' < "$WORK/summary.txt" | cut -c1-200)
+          LEARNED_OUT=$(jq -r '.learned // ""' "$WORK/model.txt" | tr '\t\r\n' '   ' | cut -c1-300)
+          NEXT_OUT=$(jq -r '.next // ""' "$WORK/model.txt" | tr '\t\r\n' '   ' | cut -c1-300)
+          SPEC_COMPLETE=$(jq -r '.spec_complete == true' "$WORK/model.txt")
+          {
+            echo "summary=$SUMMARY"
+            echo "learned=$LEARNED_OUT"
+            echo "next=$NEXT_OUT"
+            echo "spec_complete=$SPEC_COMPLETE"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Builder"
+            echo "- **Model:** $BUILDER_MODEL (stop_reason: $STOP)"
+            echo "- **Summary:** $SUMMARY"
+            echo "- **Files:**"
+            git status --porcelain | sed 's/^/    /'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Commit builder output
+        id: commit
         env:
           SPEC_ID: ${{ needs.architect.outputs.current_spec }}
+          BUILD_BRANCH: ${{ needs.architect.outputs.build_branch }}
+          SUMMARY: ${{ steps.generate.outputs.summary }}
         run: |
+          set -euo pipefail
           git config user.name "Centaurion Builder Agent"
           git config user.email "builder@centaurion.me"
           git add -A
-          git commit -m "builder: $SPEC_ID - TDD cycle $(date +%Y-%m-%d)" || echo "No changes"
-          git push origin builder/$SPEC_ID-$(date +%Y%m%d) || echo "Push failed"
+          if git diff --staged --quiet; then
+            echo "::error::Builder produced no file changes"
+            exit 1
+          fi
+          FILES=$(git diff --staged --name-only | wc -l | tr -d ' ')
+          echo "files_changed=$FILES" >> "$GITHUB_OUTPUT"
+          if git diff --staged --name-only | grep -q '^\.github/'; then
+            echo "::error::Builder touched .github/ - refusing to commit"; exit 1
+          fi
+          git commit -m "builder: $SPEC_ID - $SUMMARY"
+          git push origin "$BUILD_BRANCH"
 
   reviewer:
-    name: "Reviewer - Test & Validate"
+    name: "Reviewer - Measure"
     needs: [architect, builder]
     runs-on: ubuntu-latest
     if: github.event.inputs.mode != 'report'
+    outputs:
+      score: ${{ steps.measure.outputs.score }}
+      tests_passed: ${{ steps.measure.outputs.tests_passed }}
+      tests_failed: ${{ steps.measure.outputs.tests_failed }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
-          ref: builder/${{ needs.architect.outputs.current_spec }}-${{ github.run_id }}
+          ref: ${{ needs.architect.outputs.build_branch }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '20'
 
-      - name: Run tests
+      - name: Run tests and compute score
+        id: measure
         run: |
-          cd centaurion-framework
-          # Install dependencies if package.json exists
-          [ -f package.json ] && npm ci || echo "No package.json yet"
-          # Run tests
-          npx jest tests/ --passWithNoTests 2>&1 | tee /tmp/test-results.txt || true
-
-      - name: Log review results
-        run: |
-          echo "## Reviewer Results" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cat /tmp/test-results.txt >> $GITHUB_STEP_SUMMARY || echo "No test output"
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          set -euo pipefail
+          cd "$FRAMEWORK_DIR"
+          if [ ! -f package.json ]; then
+            echo "::error::package.json missing on build branch - Builder must create it"
+            echo "score=0" >> "$GITHUB_OUTPUT"; echo "tests_passed=0" >> "$GITHUB_OUTPUT"; echo "tests_failed=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -f package-lock.json ]; then npm ci; else npm install --no-audit --no-fund; fi
+          # A failing test suite is a DISCARD, not a broken pipeline: never fail this job on red tests.
+          set +e
+          npx jest --ci --json --outputFile=/tmp/jest.json 2>&1 | tee /tmp/test-results.txt
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          bash .github/scripts/score.sh /tmp/jest.json | tee -a "$GITHUB_OUTPUT"
+          {
+            echo "## Reviewer - Measure"
+            echo '```'
+            bash .github/scripts/score.sh /tmp/jest.json
+            echo '```'
+            echo "<details><summary>jest output</summary>"; echo; echo '```'
+            tail -80 /tmp/test-results.txt
+            echo '```'; echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   reporter:
-    name: "Reporter - Push & Update"
+    name: "Reporter - Keep or Discard"
     needs: [architect, builder, reviewer]
-    if: always()
+    if: always() && needs.architect.result == 'success'
     runs-on: ubuntu-latest
+    env:
+      SPEC_ID: ${{ needs.architect.outputs.current_spec }}
+      SPEC_TITLE: ${{ needs.architect.outputs.spec_title }}
+      BUILD_BRANCH: ${{ needs.architect.outputs.build_branch }}
+      BUILDER_RESULT: ${{ needs.builder.result }}
+      REVIEWER_RESULT: ${{ needs.reviewer.result }}
+      SUMMARY: ${{ needs.builder.outputs.summary }}
+      LEARNED: ${{ needs.builder.outputs.learned }}
+      NEXT: ${{ needs.builder.outputs.next }}
+      SPEC_COMPLETE: ${{ needs.builder.outputs.spec_complete }}
+      FILES_CHANGED: ${{ needs.builder.outputs.files_changed }}
+      SCORE: ${{ needs.reviewer.outputs.score }}
+      TESTS_FAILED: ${{ needs.reviewer.outputs.tests_failed }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
 
-      - name: Update results.tsv
-        env:
-          SPEC_ID: ${{ needs.architect.outputs.current_spec }}
+      - name: Decide KEEP or DISCARD
+        id: decide
         run: |
-          DATE=$(date +%Y-%m-%d)
-          echo "$DATE\t$SPEC_ID\tbuilding\t--\t--\tDaily automated cycle" >> centaurion-framework/results.tsv
-
-      - name: Update methodology.md with progress
-        env:
-          SPEC_ID: ${{ needs.architect.outputs.current_spec }}
-        run: |
-          sed -i "s/### Current Spec:.*/### Current Spec: $SPEC_ID (in progress)/" centaurion-framework/methodology.md
-
-      - name: Commit and push report
-        run: |
+          set -euo pipefail
           git config user.name "Centaurion Reporter Agent"
           git config user.email "reporter@centaurion.me"
-          git add -A
-          git diff --staged --quiet || git commit -m "report: daily progress $(date +%Y-%m-%d)"
-          git push || echo "Nothing to push"
+          PREV_BEST=$(bash .github/scripts/prev-best.sh "$FRAMEWORK_DIR/results.tsv" "$SPEC_ID")
+          if [ "$BUILDER_RESULT" != "success" ] || [ "$REVIEWER_RESULT" != "success" ]; then
+            VERDICT=DISCARD; SCORE=0; TESTS_FAILED=1
+            echo "Pipeline stage failed (builder=$BUILDER_RESULT reviewer=$REVIEWER_RESULT) -> DISCARD"
+          else
+            VERDICT=$(bash .github/scripts/decide.sh "${SCORE:-0}" "$PREV_BEST" "${TESTS_FAILED:-1}" "${FILES_CHANGED:-0}" "$MAX_FILES_PER_RUN")
+          fi
+          {
+            echo "verdict=$VERDICT"
+            echo "prev_best=$PREV_BEST"
+            echo "score=${SCORE:-0}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: KEEP - merge build branch into main
+        if: steps.decide.outputs.verdict == 'KEEP'
+        run: |
+          set -euo pipefail
+          git fetch origin "$BUILD_BRANCH"
+          # Final safety net: the build branch must not touch .github/ and must respect the file cap.
+          if git diff --name-only "origin/main...origin/$BUILD_BRANCH" | grep -q '^\.github/'; then
+            echo "::error::Build branch modifies .github/ - refusing to merge"; exit 1
+          fi
+          N=$(git diff --name-only "origin/main...origin/$BUILD_BRANCH" | wc -l | tr -d ' ')
+          if [ "$N" -gt "$MAX_FILES_PER_RUN" ]; then
+            echo "::error::Build branch changes $N files (> $MAX_FILES_PER_RUN) - refusing to merge"; exit 1
+          fi
+          git merge --no-ff "origin/$BUILD_BRANCH" -m "keep($SPEC_ID): $SUMMARY [score ${{ steps.decide.outputs.score }} > ${{ steps.decide.outputs.prev_best }}]"
+          # Learned / Next goes into the evolving program.
+          {
+            echo "- **${{ github.run_id }} / $SPEC_ID / score ${{ steps.decide.outputs.score }}** - ${SUMMARY:-n/a}"
+            [ -n "$LEARNED" ] && echo "  - learned: $LEARNED"
+            [ -n "$NEXT" ] && echo "  - next: $NEXT"
+          } >> "$FRAMEWORK_DIR/methodology.md"
+          if [ "$SPEC_COMPLETE" = "true" ]; then
+            awk -F'\t' -v OFS='\t' -v id="$SPEC_ID" -v run="${{ github.run_id }}" \
+              '$1==id && $3=="todo" {$3="done (run " run ")"} {print}' \
+              "$FRAMEWORK_DIR/specs/queue.tsv" > /tmp/queue.tsv
+            mv /tmp/queue.tsv "$FRAMEWORK_DIR/specs/queue.tsv"
+            echo "Spec $SPEC_ID marked done"
+          fi
+
+      - name: DISCARD - delete build branch
+        if: steps.decide.outputs.verdict != 'KEEP'
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin "$BUILD_BRANCH" >/dev/null 2>&1; then
+            git push origin --delete "$BUILD_BRANCH"
+            echo "Deleted discarded build branch $BUILD_BRANCH"
+          fi
+
+      - name: Log experiment and push main
+        run: |
+          set -euo pipefail
+          CHANGE=$(printf '%s' "${SUMMARY:-builder=$BUILDER_RESULT reviewer=$REVIEWER_RESULT}" | tr '\t\r\n' '   ')
+          printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$(date -u +%Y-%m-%d)" "${{ github.run_id }}" "$SPEC_ID" "$CHANGE" \
+            "${{ steps.decide.outputs.score }}" "${{ steps.decide.outputs.prev_best }}" "${{ steps.decide.outputs.verdict }}" \
+            >> "$FRAMEWORK_DIR/results.tsv"
+          git add "$FRAMEWORK_DIR/results.tsv" "$FRAMEWORK_DIR/methodology.md" "$FRAMEWORK_DIR/specs/queue.tsv"
+          git commit -m "log($SPEC_ID): ${{ steps.decide.outputs.verdict }} run ${{ github.run_id }} score ${{ steps.decide.outputs.score }}" || true
+          # Push the merge (if KEEP) + the log row together; rebase only the log commit if main moved.
+          for attempt in 1 2 3; do
+            git push origin HEAD:main && exit 0
+            echo "push attempt $attempt failed, rebasing"; git pull --rebase origin main || true
+          done
+          echo "::error::Could not push to main after 3 attempts"; exit 1
 
       - name: Post summary
         run: |
-          echo "## Daily Report - $(date +%Y-%m-%d)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Spec:** ${{ needs.architect.outputs.current_spec }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Builder:** ${{ needs.builder.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Reviewer:** ${{ needs.reviewer.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Next action:** Check results.tsv for score tracking" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Experiment ${{ github.run_id }} - $(date -u +%Y-%m-%d)"
+            echo "- **Spec:** $SPEC_ID - $SPEC_TITLE"
+            echo "- **Change:** ${SUMMARY:-n/a}"
+            echo "- **Score:** ${{ steps.decide.outputs.score }} (prev best ${{ steps.decide.outputs.prev_best }})"
+            echo "- **Verdict:** ${{ steps.decide.outputs.verdict }}"
+            [ -n "$LEARNED" ] && echo "- **Learned:** $LEARNED"
+            [ -n "$NEXT" ] && echo "- **Next:** $NEXT"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -6,6 +6,27 @@
 
 Agent Assembly is NOT a product — it's the factory. It manages the full orchestration of multiple software projects, each developed autonomously by Claude Code on daily scheduled tasks.
 
+## The Software Factory loop (nightly, unattended)
+
+Agent Assembly is Karpathy's [autoresearch](https://github.com/karpathy/autoresearch) loop
+repurposed for software. Every night at 02:00 UTC `.github/workflows/centaurion-daily-builder.yml`
+runs **one experiment**:
+
+| Stage | Job | What happens |
+|---|---|---|
+| Propose | Architect + Builder | pick the first `todo` spec in `centaurion-framework/specs/queue.tsv`; Claude proposes ONE bounded change using `methodology.md` + the last 20 rows of `results.tsv` as memory, and writes/extends `tests/<spec>.test.js` |
+| Build | Builder | files land on a throwaway branch `builder/<spec>-<date>-<run_id>` (strict JSON output, path-safety checks, no `.github/` edits, max 25 files) |
+| Measure | Reviewer | `jest --json`; **score = passing tests**; red tests make the run ineligible but never break the pipeline |
+| Keep / Discard | Reporter | `.github/scripts/decide.sh`: KEEP iff all green **and** score > previous best for that spec → merged into `main` automatically; otherwise the branch is deleted |
+| Log | Reporter | one row in `centaurion-framework/results.tsv` (`date run_id spec change score prev_best verdict`); on KEEP the Builder's *learned* / *next* notes are appended to `methodology.md` so the next run starts smarter |
+| Advance | Reporter | when the Builder reports `spec_complete: true` on a KEEP, the queue row becomes `done (run <id>)` and the next spec begins |
+
+Read `results.tsv` top to bottom to see the factory learn; edit `methodology.md` or the queue to steer it.
+Add a spec by appending a row to `specs/queue.tsv` and (optionally) a `specs/<id>.md` with acceptance criteria.
+`results-legacy.tsv` holds the pre-factory daily reports (Apr–Aug 2026).
+
+Manual run: `gh workflow run "Centaurion Daily Builder" -R MalikJPalamar/Agent-Assembly` (optional input `spec_override=s02`).
+
 ## Architecture
 
 ```
