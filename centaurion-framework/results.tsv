@@ -1,3 +1,4 @@
 date	run_id	spec	change	score	prev_best	verdict
 2026-08-20	32425712387	s01	builder=failure reviewer=skipped	0	0	DISCARD
 2026-08-20	32426645432	s01	builder=failure reviewer=skipped	0	0	DISCARD
+2026-08-20	32428580868	s01	Add Supabase schema SQL, validateReading/loadSchemaSql module, and full jest test suite for s01. 	17	0	KEEP

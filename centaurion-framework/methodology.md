@@ -33,3 +33,6 @@ CS = 0.40 x PA + 0.30 x US + 0.30 x SE
 
 ## Learned / Next
 <!-- Reporter appends entries below on every KEEP. Newest last. -->
+- **32428580868 / s01 / score 17** - Add Supabase schema SQL, validateReading/loadSchemaSql module, and full jest test suite for s01. 
+  - learned: A concrete schema.sql plus small pure-function validator is enough to satisfy s01's acceptance criteria without any runtime deps. 
+  - next: Consider adding a migration runner stub or a JSON-schema export for downstream Terra ingestion once s01 is kept. 
