@@ -37,8 +37,9 @@ jobs:
       current_spec: ${{ steps.select.outputs.spec_id }}
       spec_title: ${{ steps.select.outputs.spec_title }}
       spec_phase: ${{ steps.select.outputs.spec_phase }}
+      build_branch: ${{ steps.select.outputs.build_branch }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Select next spec from priority queue
         id: select
@@ -57,6 +58,9 @@ jobs:
             echo "spec_title=${CURRENT:-s01 Supabase Schema}" >> $GITHUB_OUTPUT
             echo "spec_phase=auto" >> $GITHUB_OUTPUT
           fi
+          # Single source of truth for the builder branch name (shared with reviewer)
+          SPEC=$(grep '^spec_id=' $GITHUB_OUTPUT | tail -1 | cut -d= -f2)
+          echo "build_branch=builder/${SPEC}-$(date +%Y%m%d)-${{ github.run_id }}" >> $GITHUB_OUTPUT
 
       - name: Log architect decision
         run: |
@@ -71,21 +75,26 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event.inputs.mode != 'report'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '20'
 
       - name: Read spec and generate implementation
         env:
           SPEC_ID: ${{ needs.architect.outputs.current_spec }}
+          BUILD_BRANCH: ${{ needs.architect.outputs.build_branch }}
         run: |
-          echo "Building spec: $SPEC_ID"
+          echo "Building spec: $SPEC_ID on $BUILD_BRANCH"
 
           # Create working branch
-          git checkout -b builder/$SPEC_ID-$(date +%Y%m%d)
+          git checkout -b "$BUILD_BRANCH"
+
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::warning::ANTHROPIC_API_KEY secret is not set - Builder will only write stub files. Set it with: gh secret set ANTHROPIC_API_KEY"
+          fi
 
           # Call Claude API to generate tests + implementation
           SPEC_FILE="centaurion-framework/specs"
@@ -128,12 +137,13 @@ jobs:
       - name: Commit builder output
         env:
           SPEC_ID: ${{ needs.architect.outputs.current_spec }}
+          BUILD_BRANCH: ${{ needs.architect.outputs.build_branch }}
         run: |
           git config user.name "Centaurion Builder Agent"
           git config user.email "builder@centaurion.me"
           git add -A
           git commit -m "builder: $SPEC_ID - TDD cycle $(date +%Y-%m-%d)" || echo "No changes"
-          git push origin builder/$SPEC_ID-$(date +%Y%m%d) || echo "Push failed"
+          git push origin "$BUILD_BRANCH"
 
   reviewer:
     name: "Reviewer - Test & Validate"
@@ -141,12 +151,12 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event.inputs.mode != 'report'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
-          ref: builder/${{ needs.architect.outputs.current_spec }}-${{ github.run_id }}
+          ref: ${{ needs.architect.outputs.build_branch }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '20'
 
@@ -171,14 +181,14 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Update results.tsv
         env:
           SPEC_ID: ${{ needs.architect.outputs.current_spec }}
         run: |
           DATE=$(date +%Y-%m-%d)
-          echo "$DATE\t$SPEC_ID\tbuilding\t--\t--\tDaily automated cycle" >> centaurion-framework/results.tsv
+          printf '%s\t%s\tbuilding\t--\t--\tDaily automated cycle\n' "$DATE" "$SPEC_ID" >> centaurion-framework/results.tsv
 
       - name: Update methodology.md with progress
         env:
