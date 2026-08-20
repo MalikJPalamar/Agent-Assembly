@@ -15,7 +15,7 @@ appends to **Learned / Next** after every KEEP. Humans edit it to steer.
 3. **Measure** — Reviewer runs `jest --json`; **score = number of passing
    tests**; a run is only eligible if zero tests fail.
 4. **Keep / Discard** — `.github/scripts/decide.sh`:
-   KEEP iff all green AND score > previous best for that spec AND ≤ 25 files
+   KEEP iff all green AND score > previous best across the whole suite (global, so each run must add net new passing tests) AND ≤ 25 files
    changed. KEEP merges the branch into `main` unattended; DISCARD deletes it.
 5. **Log** — one row per run in `results.tsv`
    (`date run_id spec change score prev_best verdict`), and on KEEP the

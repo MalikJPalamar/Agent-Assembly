@@ -144,7 +144,7 @@ jobs:
           fi
           EXISTING=$(cd "$FRAMEWORK_DIR" && { find src tests -type f 2>/dev/null || true; } | sort | head -200)
           HISTORY=$(tail -n 20 "$FRAMEWORK_DIR/results.tsv")
-          PREV_BEST=$(bash .github/scripts/prev-best.sh "$FRAMEWORK_DIR/results.tsv" "$SPEC_ID")
+          PREV_BEST=$(bash .github/scripts/prev-best.sh "$FRAMEWORK_DIR/results.tsv")
           LEARNED=$(sed -n '/^## Learned \/ Next/,$p' "$FRAMEWORK_DIR/methodology.md" | tail -n 40)
 
           cat > "$WORK/prompt.txt" <<EOF
@@ -154,7 +154,7 @@ jobs:
           ## This is ONE experiment in a nightly keep/discard loop
           Propose ONE bounded change that moves spec $SPEC_ID - $SPEC_TITLE forward.
           Your run is scored by the number of passing jest tests; it is KEPT (merged) only if
-          zero tests fail AND the score beats the previous best for this spec ($PREV_BEST).
+          zero tests fail AND the score beats the previous best across the whole suite ($PREV_BEST) - so you must add net new passing tests.
           So: add or complete acceptance tests in tests/$SPEC_ID.test.js and make them pass with
           code under src/$SPEC_ID/. Never delete or weaken existing tests. Keep the change small
           (max $MAX_FILES_PER_RUN files). CommonJS, Node 20, jest 29, no network access, no
@@ -335,7 +335,7 @@ jobs:
           set -euo pipefail
           git config user.name "Centaurion Reporter Agent"
           git config user.email "reporter@centaurion.me"
-          PREV_BEST=$(bash .github/scripts/prev-best.sh "$FRAMEWORK_DIR/results.tsv" "$SPEC_ID")
+          PREV_BEST=$(bash .github/scripts/prev-best.sh "$FRAMEWORK_DIR/results.tsv")
           if [ "$BUILDER_RESULT" != "success" ] || [ "$REVIEWER_RESULT" != "success" ]; then
             VERDICT=DISCARD; SCORE=0; TESTS_FAILED=1
             echo "Pipeline stage failed (builder=$BUILDER_RESULT reviewer=$REVIEWER_RESULT) -> DISCARD"
@@ -365,8 +365,8 @@ jobs:
           # Learned / Next goes into the evolving program.
           {
             echo "- **${{ github.run_id }} / $SPEC_ID / score ${{ steps.decide.outputs.score }}** - ${SUMMARY:-n/a}"
-            [ -n "$LEARNED" ] && echo "  - learned: $LEARNED"
-            [ -n "$NEXT" ] && echo "  - next: $NEXT"
+            if [ -n "$LEARNED" ]; then echo "  - learned: $LEARNED"; fi
+            if [ -n "$NEXT" ]; then echo "  - next: $NEXT"; fi
           } >> "$FRAMEWORK_DIR/methodology.md"
           if [ "$SPEC_COMPLETE" = "true" ]; then
             awk -F'\t' -v OFS='\t' -v id="$SPEC_ID" -v run="${{ github.run_id }}" \
@@ -410,6 +410,6 @@ jobs:
             echo "- **Change:** ${SUMMARY:-n/a}"
             echo "- **Score:** ${{ steps.decide.outputs.score }} (prev best ${{ steps.decide.outputs.prev_best }})"
             echo "- **Verdict:** ${{ steps.decide.outputs.verdict }}"
-            [ -n "$LEARNED" ] && echo "- **Learned:** $LEARNED"
-            [ -n "$NEXT" ] && echo "- **Next:** $NEXT"
+            if [ -n "$LEARNED" ]; then echo "- **Learned:** $LEARNED"; fi
+            if [ -n "$NEXT" ]; then echo "- **Next:** $NEXT"; fi
           } >> "$GITHUB_STEP_SUMMARY"
