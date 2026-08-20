@@ -365,8 +365,8 @@ jobs:
           # Learned / Next goes into the evolving program.
           {
             echo "- **${{ github.run_id }} / $SPEC_ID / score ${{ steps.decide.outputs.score }}** - ${SUMMARY:-n/a}"
-            [ -n "$LEARNED" ] && echo "  - learned: $LEARNED"
-            [ -n "$NEXT" ] && echo "  - next: $NEXT"
+            if [ -n "$LEARNED" ]; then echo "  - learned: $LEARNED"; fi
+            if [ -n "$NEXT" ]; then echo "  - next: $NEXT"; fi
           } >> "$FRAMEWORK_DIR/methodology.md"
           if [ "$SPEC_COMPLETE" = "true" ]; then
             awk -F'\t' -v OFS='\t' -v id="$SPEC_ID" -v run="${{ github.run_id }}" \
@@ -410,6 +410,6 @@ jobs:
             echo "- **Change:** ${SUMMARY:-n/a}"
             echo "- **Score:** ${{ steps.decide.outputs.score }} (prev best ${{ steps.decide.outputs.prev_best }})"
             echo "- **Verdict:** ${{ steps.decide.outputs.verdict }}"
-            [ -n "$LEARNED" ] && echo "- **Learned:** $LEARNED"
-            [ -n "$NEXT" ] && echo "- **Next:** $NEXT"
+            if [ -n "$LEARNED" ]; then echo "- **Learned:** $LEARNED"; fi
+            if [ -n "$NEXT" ]; then echo "- **Next:** $NEXT"; fi
           } >> "$GITHUB_STEP_SUMMARY"
