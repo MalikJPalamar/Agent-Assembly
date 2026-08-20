@@ -17,7 +17,7 @@ runs **one experiment**:
 | Propose | Architect + Builder | pick the first `todo` spec in `centaurion-framework/specs/queue.tsv`; Claude proposes ONE bounded change using `methodology.md` + the last 20 rows of `results.tsv` as memory, and writes/extends `tests/<spec>.test.js` |
 | Build | Builder | files land on a throwaway branch `builder/<spec>-<date>-<run_id>` (strict JSON output, path-safety checks, no `.github/` edits, max 25 files) |
 | Measure | Reviewer | `jest --json`; **score = passing tests**; red tests make the run ineligible but never break the pipeline |
-| Keep / Discard | Reporter | `.github/scripts/decide.sh`: KEEP iff all green **and** score > previous best for that spec → merged into `main` automatically; otherwise the branch is deleted |
+| Keep / Discard | Reporter | `.github/scripts/decide.sh`: KEEP iff all green **and** score > previous best (global, whole suite) → merged into `main` automatically; otherwise the branch is deleted |
 | Log | Reporter | one row in `centaurion-framework/results.tsv` (`date run_id spec change score prev_best verdict`); on KEEP the Builder's *learned* / *next* notes are appended to `methodology.md` so the next run starts smarter |
 | Advance | Reporter | when the Builder reports `spec_complete: true` on a KEEP, the queue row becomes `done (run <id>)` and the next spec begins |
 
