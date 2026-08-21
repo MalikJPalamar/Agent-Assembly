@@ -36,3 +36,6 @@ CS = 0.40 x PA + 0.30 x US + 0.30 x SE
 - **32428580868 / s01 / score 17** - Add Supabase schema SQL, validateReading/loadSchemaSql module, and full jest test suite for s01. 
   - learned: A concrete schema.sql plus small pure-function validator is enough to satisfy s01's acceptance criteria without any runtime deps. 
   - next: Consider adding a migration runner stub or a JSON-schema export for downstream Terra ingestion once s01 is kept. 
+- **32441762179 / s02 / score 37** - Add s02 Terra sandbox client (connect/disconnect users, webhook validation/normalization) with full jest coverage. 
+  - learned: A pure in-memory sandbox client plus payload validators/normalizers is enough to model Terra's connect+webhook flow without network deps. 
+  - next: Add a fixtures file with realistic Terra webhook payloads and a sandbox event replay/history log for downstream ingestion testing. 
