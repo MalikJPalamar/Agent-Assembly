@@ -39,3 +39,6 @@ CS = 0.40 x PA + 0.30 x US + 0.30 x SE
 - **32441762179 / s02 / score 37** - Add s02 Terra sandbox client (connect/disconnect users, webhook validation/normalization) with full jest coverage. 
   - learned: A pure in-memory sandbox client plus payload validators/normalizers is enough to model Terra's connect+webhook flow without network deps. 
   - next: Add a fixtures file with realistic Terra webhook payloads and a sandbox event replay/history log for downstream ingestion testing. 
+- **32614178222 / s02 / score 62** - Rewrote s02 sandbox client with connect/disconnect, webhook validate/normalize, and a tested EventLog module. 
+  - learned: A self-contained rewrite of both src/s02/index.js and tests/s02.test.js avoids drift from an unseen prior implementation that risked hidden failures. 
+  - next: Add multi-user webhook batch ingestion and a JSON schema export for Terra payloads once this slice is confirmed kept. 
