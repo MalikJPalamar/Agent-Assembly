@@ -1,356 +1,414 @@
 'use strict';
 
 const {
-  VALID_PROVIDERS,
-  VALID_WEBHOOK_TYPES,
-  TerraSandboxClient,
+  SUPPORTED_PROVIDERS,
+  SUPPORTED_TYPES,
+  SandboxClient,
   validateWebhookPayload,
   normalizeWebhookPayload,
   EventLog,
-  FIXTURES,
-} = require('../src/s02');
+  ingestWebhookBatch,
+  getTerraWebhookSchema,
+} = require('../src/s02/index.js');
 
-describe('s02 constants', () => {
-  test('exposes valid providers', () => {
-    expect(VALID_PROVIDERS).toEqual(
-      expect.arrayContaining(['FITBIT', 'GARMIN', 'OURA', 'WHOOP', 'APPLE', 'GOOGLE'])
-    );
+describe('module constants', () => {
+  test('SUPPORTED_PROVIDERS is a non-empty array of strings', () => {
+    expect(Array.isArray(SUPPORTED_PROVIDERS)).toBe(true);
+    expect(SUPPORTED_PROVIDERS.length).toBeGreaterThan(0);
   });
 
-  test('exposes valid webhook types', () => {
-    expect(VALID_WEBHOOK_TYPES).toEqual(expect.arrayContaining(['auth', 'deauth', 'activity', 'sleep']));
+  test('SUPPORTED_TYPES is a non-empty array of strings', () => {
+    expect(Array.isArray(SUPPORTED_TYPES)).toBe(true);
+    expect(SUPPORTED_TYPES.length).toBeGreaterThan(0);
   });
 });
 
-describe('TerraSandboxClient - connect/disconnect', () => {
-  function makeClient() {
-    let tick = 0;
-    return new TerraSandboxClient({ clock: () => `2024-01-01T00:00:0${tick++}Z` });
-  }
-
-  test('connectUser returns a connection record', () => {
-    const client = makeClient();
-    const conn = client.connectUser('alice', 'FITBIT');
-    expect(conn.userId).toBe('alice');
-    expect(conn.provider).toBe('FITBIT');
-    expect(conn.active).toBe(true);
-    expect(typeof conn.referenceId).toBe('string');
-    expect(conn.referenceId.length).toBeGreaterThan(0);
+describe('SandboxClient.connectUser', () => {
+  test('connects a valid user with a valid provider', () => {
+    const client = new SandboxClient();
+    const conn = client.connectUser('user-1', 'garmin');
+    expect(conn.userId).toBe('user-1');
+    expect(conn.provider).toBe('garmin');
   });
 
-  test('connectUser generates deterministic referenceId for same inputs', () => {
-    const client1 = makeClient();
-    const client2 = makeClient();
-    const c1 = client1.connectUser('bob', 'GARMIN');
-    const c2 = client2.connectUser('bob', 'GARMIN');
-    expect(c1.referenceId).toBe(c2.referenceId);
+  test('returns a connection object with connectedAt timestamp', () => {
+    const client = new SandboxClient();
+    const conn = client.connectUser('user-1', 'fitbit');
+    expect(typeof conn.connectedAt).toBe('string');
+    expect(Number.isNaN(new Date(conn.connectedAt).getTime())).toBe(false);
   });
 
-  test('connectUser rejects empty userId', () => {
-    const client = makeClient();
-    expect(() => client.connectUser('', 'FITBIT')).toThrow(TypeError);
+  test('throws when userId is missing', () => {
+    const client = new SandboxClient();
+    expect(() => client.connectUser(undefined, 'garmin')).toThrow();
   });
 
-  test('connectUser rejects non-string userId', () => {
-    const client = makeClient();
-    expect(() => client.connectUser(123, 'FITBIT')).toThrow(TypeError);
+  test('throws when userId is an empty string', () => {
+    const client = new SandboxClient();
+    expect(() => client.connectUser('   ', 'garmin')).toThrow();
   });
 
-  test('connectUser rejects unsupported provider', () => {
-    const client = makeClient();
-    expect(() => client.connectUser('alice', 'NOT_A_PROVIDER')).toThrow(RangeError);
+  test('throws on unsupported provider', () => {
+    const client = new SandboxClient();
+    expect(() => client.connectUser('user-1', 'notreal')).toThrow(/unsupported provider/);
   });
 
-  test('isConnected reflects connection state', () => {
-    const client = makeClient();
-    expect(client.isConnected('alice')).toBe(false);
-    client.connectUser('alice', 'OURA');
-    expect(client.isConnected('alice')).toBe(true);
+  test('reconnecting the same user updates the provider', () => {
+    const client = new SandboxClient();
+    client.connectUser('user-1', 'garmin');
+    client.connectUser('user-1', 'oura');
+    expect(client.getConnection('user-1').provider).toBe('oura');
+  });
+});
+
+describe('SandboxClient.disconnectUser', () => {
+  test('returns true when disconnecting an existing user', () => {
+    const client = new SandboxClient();
+    client.connectUser('user-1', 'garmin');
+    expect(client.disconnectUser('user-1')).toBe(true);
   });
 
-  test('disconnectUser marks connection inactive and returns true', () => {
-    const client = makeClient();
-    client.connectUser('alice', 'OURA');
-    const result = client.disconnectUser('alice');
-    expect(result).toBe(true);
-    expect(client.isConnected('alice')).toBe(false);
+  test('returns false when disconnecting a non-existing user', () => {
+    const client = new SandboxClient();
+    expect(client.disconnectUser('ghost')).toBe(false);
   });
 
-  test('disconnectUser sets disconnectedAt timestamp', () => {
-    const client = makeClient();
-    client.connectUser('alice', 'OURA');
-    client.disconnectUser('alice');
-    const conn = client.getConnection('alice');
-    expect(conn.disconnectedAt).toBeDefined();
+  test('isConnected returns false after disconnect', () => {
+    const client = new SandboxClient();
+    client.connectUser('user-1', 'garmin');
+    client.disconnectUser('user-1');
+    expect(client.isConnected('user-1')).toBe(false);
+  });
+});
+
+describe('SandboxClient.isConnected', () => {
+  test('returns true for a connected user', () => {
+    const client = new SandboxClient();
+    client.connectUser('user-1', 'garmin');
+    expect(client.isConnected('user-1')).toBe(true);
   });
 
-  test('disconnectUser returns false for unknown user', () => {
-    const client = makeClient();
-    expect(client.disconnectUser('nobody')).toBe(false);
+  test('returns false for an unknown user', () => {
+    const client = new SandboxClient();
+    expect(client.isConnected('unknown')).toBe(false);
+  });
+});
+
+describe('SandboxClient.getConnection', () => {
+  test('returns a copy of the connection data', () => {
+    const client = new SandboxClient();
+    client.connectUser('user-1', 'garmin');
+    const a = client.getConnection('user-1');
+    a.provider = 'mutated';
+    expect(client.getConnection('user-1').provider).toBe('garmin');
   });
 
-  test('getConnection returns null for unknown user', () => {
-    const client = makeClient();
-    expect(client.getConnection('nobody')).toBeNull();
+  test('returns undefined for an unknown user', () => {
+    const client = new SandboxClient();
+    expect(client.getConnection('unknown')).toBeUndefined();
+  });
+});
+
+describe('SandboxClient.listConnections', () => {
+  test('returns an empty array initially', () => {
+    const client = new SandboxClient();
+    expect(client.listConnections()).toEqual([]);
   });
 
-  test('getConnection returns a copy, not a live reference', () => {
-    const client = makeClient();
-    client.connectUser('alice', 'WHOOP');
-    const conn = client.getConnection('alice');
-    conn.active = false;
-    expect(client.isConnected('alice')).toBe(true);
-  });
-
-  test('listConnections returns all connected users', () => {
-    const client = makeClient();
-    client.connectUser('alice', 'FITBIT');
-    client.connectUser('bob', 'GARMIN');
+  test('returns all connected users', () => {
+    const client = new SandboxClient();
+    client.connectUser('user-1', 'garmin');
+    client.connectUser('user-2', 'fitbit');
     const list = client.listConnections();
-    expect(list).toHaveLength(2);
-    expect(list.map((c) => c.userId).sort()).toEqual(['alice', 'bob']);
+    expect(list.length).toBe(2);
+    expect(list.map((c) => c.userId).sort()).toEqual(['user-1', 'user-2']);
   });
 
-  test('reconnecting a user overwrites the previous connection', () => {
-    const client = makeClient();
-    client.connectUser('alice', 'FITBIT');
-    client.disconnectUser('alice');
-    const conn = client.connectUser('alice', 'GARMIN');
-    expect(conn.active).toBe(true);
-    expect(conn.provider).toBe('GARMIN');
-    expect(client.isConnected('alice')).toBe(true);
+  test('returned entries are independent copies', () => {
+    const client = new SandboxClient();
+    client.connectUser('user-1', 'garmin');
+    const list = client.listConnections();
+    list[0].provider = 'mutated';
+    expect(client.getConnection('user-1').provider).toBe('garmin');
   });
 });
+
+function basePayload(overrides = {}) {
+  return {
+    user_id: 'user-1',
+    type: 'activity',
+    provider: 'garmin',
+    timestamp: '2024-01-01T00:00:00.000Z',
+    data: { steps: 1000 },
+    ...overrides,
+  };
+}
 
 describe('validateWebhookPayload', () => {
-  test('rejects non-object payloads', () => {
-    expect(validateWebhookPayload(null).valid).toBe(false);
-    expect(validateWebhookPayload('string').valid).toBe(false);
-    expect(validateWebhookPayload([]).valid).toBe(false);
+  test('valid for activity type', () => {
+    expect(validateWebhookPayload(basePayload({ type: 'activity' })).valid).toBe(true);
   });
 
-  test('rejects payload missing type', () => {
-    const { valid, errors } = validateWebhookPayload({ user: { user_id: 'u1', provider: 'FITBIT' } });
-    expect(valid).toBe(false);
-    expect(errors).toContain('type is required');
+  test('valid for sleep type', () => {
+    expect(validateWebhookPayload(basePayload({ type: 'sleep' })).valid).toBe(true);
   });
 
-  test('rejects unsupported type', () => {
-    const { valid, errors } = validateWebhookPayload({
-      type: 'bogus',
-      user: { user_id: 'u1', provider: 'FITBIT' },
-      data: [],
-    });
-    expect(valid).toBe(false);
-    expect(errors.some((e) => e.includes('unsupported type'))).toBe(true);
+  test('valid for body type', () => {
+    expect(validateWebhookPayload(basePayload({ type: 'body' })).valid).toBe(true);
   });
 
-  test('rejects payload missing user', () => {
-    const { valid, errors } = validateWebhookPayload({ type: 'auth' });
-    expect(valid).toBe(false);
-    expect(errors).toContain('user object is required');
+  test('valid for daily type', () => {
+    expect(validateWebhookPayload(basePayload({ type: 'daily' })).valid).toBe(true);
   });
 
-  test('rejects user missing user_id', () => {
-    const { valid, errors } = validateWebhookPayload({ type: 'auth', user: { provider: 'FITBIT' } });
-    expect(valid).toBe(false);
-    expect(errors).toContain('user.user_id is required');
+  test('invalid when payload is null', () => {
+    const res = validateWebhookPayload(null);
+    expect(res.valid).toBe(false);
   });
 
-  test('rejects user missing provider', () => {
-    const { valid, errors } = validateWebhookPayload({ type: 'auth', user: { user_id: 'u1' } });
-    expect(valid).toBe(false);
-    expect(errors).toContain('user.provider is required');
+  test('invalid when payload is not an object', () => {
+    const res = validateWebhookPayload('nope');
+    expect(res.valid).toBe(false);
   });
 
-  test('accepts a valid auth payload without data', () => {
-    const { valid, errors } = validateWebhookPayload(FIXTURES.auth);
-    expect(valid).toBe(true);
-    expect(errors).toHaveLength(0);
+  test('invalid when user_id is missing', () => {
+    const res = validateWebhookPayload(basePayload({ user_id: undefined }));
+    expect(res.valid).toBe(false);
+    expect(res.errors.join(' ')).toMatch(/user_id/);
   });
 
-  test('accepts a valid deauth payload without data', () => {
-    const { valid } = validateWebhookPayload(FIXTURES.deauth);
-    expect(valid).toBe(true);
+  test('invalid when user_id is an empty string', () => {
+    const res = validateWebhookPayload(basePayload({ user_id: '   ' }));
+    expect(res.valid).toBe(false);
   });
 
-  test('requires data array for data webhook types', () => {
-    const { valid, errors } = validateWebhookPayload({
-      type: 'activity',
-      user: { user_id: 'u1', provider: 'GARMIN' },
-    });
-    expect(valid).toBe(false);
-    expect(errors).toContain('data must be an array for data webhooks');
+  test('invalid when type is missing', () => {
+    const res = validateWebhookPayload(basePayload({ type: undefined }));
+    expect(res.valid).toBe(false);
   });
 
-  test('accepts a valid activity payload with data', () => {
-    const { valid } = validateWebhookPayload(FIXTURES.activity);
-    expect(valid).toBe(true);
+  test('invalid when type is unsupported', () => {
+    const res = validateWebhookPayload(basePayload({ type: 'bogus' }));
+    expect(res.valid).toBe(false);
+    expect(res.errors.join(' ')).toMatch(/type must be one of/);
   });
 
-  test('accepts a valid sleep payload with data', () => {
-    const { valid } = validateWebhookPayload(FIXTURES.sleep);
-    expect(valid).toBe(true);
+  test('invalid when timestamp is missing', () => {
+    const res = validateWebhookPayload(basePayload({ timestamp: undefined }));
+    expect(res.valid).toBe(false);
+  });
+
+  test('invalid when timestamp is not a valid date string', () => {
+    const res = validateWebhookPayload(basePayload({ timestamp: 'not-a-date' }));
+    expect(res.valid).toBe(false);
+  });
+
+  test('invalid when data is missing', () => {
+    const res = validateWebhookPayload(basePayload({ data: undefined }));
+    expect(res.valid).toBe(false);
+  });
+
+  test('invalid when data is an array', () => {
+    const res = validateWebhookPayload(basePayload({ data: [1, 2, 3] }));
+    expect(res.valid).toBe(false);
+  });
+
+  test('accumulates multiple errors', () => {
+    const res = validateWebhookPayload({});
+    expect(res.valid).toBe(false);
+    expect(res.errors.length).toBeGreaterThanOrEqual(3);
   });
 });
 
 describe('normalizeWebhookPayload', () => {
-  test('throws for invalid payload', () => {
-    expect(() => normalizeWebhookPayload({ type: 'bogus' })).toThrow(/invalid webhook payload/);
-  });
-
-  test('normalizes an auth payload with no records', () => {
-    const normalized = normalizeWebhookPayload(FIXTURES.auth);
-    expect(normalized.type).toBe('auth');
+  test('normalizes a valid activity payload', () => {
+    const normalized = normalizeWebhookPayload(basePayload());
     expect(normalized.userId).toBe('user-1');
-    expect(normalized.provider).toBe('FITBIT');
-    expect(normalized.records).toEqual([]);
+    expect(normalized.type).toBe('activity');
+    expect(normalized.provider).toBe('garmin');
+    expect(normalized.data).toEqual({ steps: 1000 });
   });
 
-  test('uppercases the provider', () => {
-    const normalized = normalizeWebhookPayload({
-      type: 'auth',
-      user: { user_id: 'u1', provider: 'fitbit' },
-    });
-    expect(normalized.provider).toBe('FITBIT');
+  test('trims whitespace from user_id', () => {
+    const normalized = normalizeWebhookPayload(basePayload({ user_id: '  user-1  ' }));
+    expect(normalized.userId).toBe('user-1');
   });
 
-  test('normalizes activity payload records with metadata and summary', () => {
-    const normalized = normalizeWebhookPayload(FIXTURES.activity);
-    expect(normalized.records).toHaveLength(1);
-    expect(normalized.records[0]).toEqual({
-      index: 0,
-      metadata: { start_time: '2024-01-01T00:00:00Z' },
-      summary: { steps: 1000 },
-    });
+  test('defaults provider to unknown when missing', () => {
+    const normalized = normalizeWebhookPayload(basePayload({ provider: undefined }));
+    expect(normalized.provider).toBe('unknown');
   });
 
-  test('defaults missing metadata/summary to empty objects', () => {
-    const normalized = normalizeWebhookPayload({
-      type: 'daily',
-      user: { user_id: 'u1', provider: 'OURA' },
-      data: [{}],
-    });
-    expect(normalized.records[0]).toEqual({ index: 0, metadata: {}, summary: {} });
+  test('preserves provider when present', () => {
+    const normalized = normalizeWebhookPayload(basePayload({ provider: 'oura' }));
+    expect(normalized.provider).toBe('oura');
   });
 
-  test('uses received_at when provided', () => {
-    const normalized = normalizeWebhookPayload({
-      type: 'auth',
-      user: { user_id: 'u1', provider: 'FITBIT' },
-      received_at: '2024-05-01T00:00:00Z',
-    });
-    expect(normalized.receivedAt).toBe('2024-05-01T00:00:00Z');
+  test('converts timestamp to an ISO string', () => {
+    const normalized = normalizeWebhookPayload(basePayload({ timestamp: '2024-06-01T12:00:00Z' }));
+    expect(normalized.timestamp).toBe(new Date('2024-06-01T12:00:00Z').toISOString());
+  });
+
+  test('throws for an invalid payload', () => {
+    expect(() => normalizeWebhookPayload(basePayload({ type: 'bogus' }))).toThrow(/Invalid webhook payload/);
+  });
+
+  test('does not mutate the original data object', () => {
+    const payload = basePayload();
+    const normalized = normalizeWebhookPayload(payload);
+    normalized.data.steps = 9999;
+    expect(payload.data.steps).toBe(1000);
   });
 });
 
 describe('EventLog', () => {
   test('starts empty', () => {
     const log = new EventLog();
-    expect(log.getAll()).toEqual([]);
     expect(log.size()).toBe(0);
+    expect(log.getAll()).toEqual([]);
   });
 
-  test('log appends an event with a sequence number', () => {
+  test('append adds an event and stamps loggedAt', () => {
     const log = new EventLog();
-    const entry = log.log({ type: 'auth', userId: 'u1' });
-    expect(entry.seq).toBe(0);
-    expect(entry.type).toBe('auth');
-    expect(log.size()).toBe(1);
+    const stored = log.append({ userId: 'user-1', type: 'activity' });
+    expect(stored.userId).toBe('user-1');
+    expect(typeof stored.loggedAt).toBe('string');
   });
 
-  test('log throws for non-object events', () => {
+  test('getAll returns all appended events', () => {
     const log = new EventLog();
-    expect(() => log.log(null)).toThrow(TypeError);
-    expect(() => log.log('bad')).toThrow(TypeError);
+    log.append({ userId: 'user-1', type: 'activity' });
+    log.append({ userId: 'user-2', type: 'sleep' });
+    expect(log.getAll().length).toBe(2);
   });
 
-  test('sequence numbers increment across multiple logs', () => {
+  test('size returns the number of events', () => {
     const log = new EventLog();
-    log.log({ type: 'auth' });
-    log.log({ type: 'activity' });
-    const entries = log.getAll();
-    expect(entries.map((e) => e.seq)).toEqual([0, 1]);
+    log.append({ userId: 'user-1', type: 'activity' });
+    log.append({ userId: 'user-1', type: 'sleep' });
+    expect(log.size()).toBe(2);
   });
 
-  test('getAll returns copies, not live references', () => {
+  test('filterByUser returns only matching events', () => {
     const log = new EventLog();
-    log.log({ type: 'auth' });
-    const entries = log.getAll();
-    entries[0].type = 'mutated';
-    expect(log.getAll()[0].type).toBe('auth');
+    log.append({ userId: 'user-1', type: 'activity' });
+    log.append({ userId: 'user-2', type: 'activity' });
+    expect(log.filterByUser('user-1').length).toBe(1);
+  });
+
+  test('filterByType returns only matching events', () => {
+    const log = new EventLog();
+    log.append({ userId: 'user-1', type: 'activity' });
+    log.append({ userId: 'user-1', type: 'sleep' });
+    expect(log.filterByType('sleep').length).toBe(1);
+  });
+
+  test('replay invokes callback for each event in order', () => {
+    const log = new EventLog();
+    log.append({ userId: 'user-1', type: 'activity' });
+    log.append({ userId: 'user-2', type: 'sleep' });
+    const seen = [];
+    log.replay((event, index) => seen.push([index, event.userId]));
+    expect(seen).toEqual([[0, 'user-1'], [1, 'user-2']]);
   });
 
   test('clear empties the log', () => {
     const log = new EventLog();
-    log.log({ type: 'auth' });
+    log.append({ userId: 'user-1', type: 'activity' });
     log.clear();
     expect(log.size()).toBe(0);
-    expect(log.getAll()).toEqual([]);
   });
 
-  test('replay filters events by matching fields', () => {
+  test('getAll returns independent copies safe from mutation', () => {
     const log = new EventLog();
-    log.log({ type: 'auth', userId: 'u1' });
-    log.log({ type: 'activity', userId: 'u1' });
-    log.log({ type: 'activity', userId: 'u2' });
-    const results = log.replay({ type: 'activity', userId: 'u1' });
-    expect(results).toHaveLength(1);
-    expect(results[0].userId).toBe('u1');
-  });
-
-  test('replay with no filter returns all events', () => {
-    const log = new EventLog();
-    log.log({ type: 'auth' });
-    log.log({ type: 'deauth' });
-    expect(log.replay()).toHaveLength(2);
-  });
-
-  test('replay returns empty array when nothing matches', () => {
-    const log = new EventLog();
-    log.log({ type: 'auth' });
-    expect(log.replay({ type: 'nonexistent' })).toEqual([]);
-  });
-
-  test('default loggedAt is applied when not provided', () => {
-    const log = new EventLog();
-    const entry = log.log({ type: 'auth' });
-    expect(entry.loggedAt).toBeDefined();
-  });
-
-  test('explicit loggedAt is preserved', () => {
-    const log = new EventLog();
-    const entry = log.log({ type: 'auth', loggedAt: '2024-02-02T00:00:00Z' });
-    expect(entry.loggedAt).toBe('2024-02-02T00:00:00Z');
+    log.append({ userId: 'user-1', type: 'activity' });
+    const all = log.getAll();
+    all[0].userId = 'mutated';
+    expect(log.getAll()[0].userId).toBe('user-1');
   });
 });
 
-describe('integration: sandbox client + webhook pipeline', () => {
-  test('connect a user then process and log a normalized webhook event', () => {
-    const client = new TerraSandboxClient({ clock: () => '2024-01-01T00:00:00Z' });
+describe('ingestWebhookBatch', () => {
+  test('throws when payloads is not an array', () => {
+    const client = new SandboxClient();
     const log = new EventLog();
-
-    client.connectUser('user-1', 'GARMIN');
-    expect(client.isConnected('user-1')).toBe(true);
-
-    const normalized = normalizeWebhookPayload(FIXTURES.activity);
-    log.log(normalized);
-
-    const replayed = log.replay({ userId: 'user-1', type: 'activity' });
-    expect(replayed).toHaveLength(1);
-    expect(replayed[0].provider).toBe('GARMIN');
+    expect(() => ingestWebhookBatch(client, log, 'nope')).toThrow(/payloads must be an array/);
   });
 
-  test('deauth webhook can trigger disconnect logic', () => {
-    const client = new TerraSandboxClient({ clock: () => '2024-01-01T00:00:00Z' });
-    client.connectUser('user-1', 'FITBIT');
+  test('accepts valid payloads for connected users', () => {
+    const client = new SandboxClient();
+    const log = new EventLog();
+    client.connectUser('user-1', 'garmin');
+    const result = ingestWebhookBatch(client, log, [basePayload()]);
+    expect(result.accepted.length).toBe(1);
+    expect(result.rejected.length).toBe(0);
+  });
 
-    const normalized = normalizeWebhookPayload(FIXTURES.deauth);
-    if (normalized.type === 'deauth') {
-      client.disconnectUser(normalized.userId);
-    }
+  test('rejects payloads that fail schema validation', () => {
+    const client = new SandboxClient();
+    const log = new EventLog();
+    client.connectUser('user-1', 'garmin');
+    const result = ingestWebhookBatch(client, log, [basePayload({ type: 'bogus' })]);
+    expect(result.rejected.length).toBe(1);
+    expect(result.accepted.length).toBe(0);
+  });
 
-    expect(client.isConnected('user-1')).toBe(false);
+  test('rejects payloads for unconnected users', () => {
+    const client = new SandboxClient();
+    const log = new EventLog();
+    const result = ingestWebhookBatch(client, log, [basePayload({ user_id: 'ghost' })]);
+    expect(result.rejected.length).toBe(1);
+    expect(result.rejected[0].reason).toMatch(/not connected/);
+  });
+
+  test('handles a mixed batch of accepted and rejected payloads', () => {
+    const client = new SandboxClient();
+    const log = new EventLog();
+    client.connectUser('user-1', 'garmin');
+    const result = ingestWebhookBatch(client, log, [
+      basePayload({ user_id: 'user-1' }),
+      basePayload({ user_id: 'ghost' }),
+      basePayload({ type: 'invalid-type' }),
+    ]);
+    expect(result.accepted.length).toBe(1);
+    expect(result.rejected.length).toBe(2);
+  });
+
+  test('appends accepted events to the log', () => {
+    const client = new SandboxClient();
+    const log = new EventLog();
+    client.connectUser('user-1', 'garmin');
+    ingestWebhookBatch(client, log, [basePayload()]);
+    expect(log.size()).toBe(1);
+  });
+
+  test('does not append rejected events to the log', () => {
+    const client = new SandboxClient();
+    const log = new EventLog();
+    ingestWebhookBatch(client, log, [basePayload({ user_id: 'ghost' })]);
+    expect(log.size()).toBe(0);
+  });
+});
+
+describe('getTerraWebhookSchema', () => {
+  test('returns an object with the expected required fields', () => {
+    const schema = getTerraWebhookSchema();
+    expect(schema.required).toEqual(['user_id', 'type', 'timestamp', 'data']);
+  });
+
+  test('type property enum matches SUPPORTED_TYPES', () => {
+    const schema = getTerraWebhookSchema();
+    expect(schema.properties.type.enum).toEqual([...SUPPORTED_TYPES]);
+  });
+
+  test('provider property enum matches SUPPORTED_PROVIDERS', () => {
+    const schema = getTerraWebhookSchema();
+    expect(schema.properties.provider.enum).toEqual([...SUPPORTED_PROVIDERS]);
+  });
+
+  test('data property is described as an object', () => {
+    const schema = getTerraWebhookSchema();
+    expect(schema.properties.data.type).toBe('object');
   });
 });
 

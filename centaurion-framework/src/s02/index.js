@@ -1,69 +1,50 @@
 'use strict';
 
-const crypto = require('crypto');
-
-const VALID_PROVIDERS = ['FITBIT', 'GARMIN', 'OURA', 'WHOOP', 'APPLE', 'GOOGLE'];
-const VALID_WEBHOOK_TYPES = [
-  'auth',
-  'user_reauth',
-  'deauth',
-  'activity',
-  'body',
-  'daily',
-  'sleep',
-  'menstruation',
-  'nutrition',
-];
+const SUPPORTED_PROVIDERS = Object.freeze(['garmin', 'fitbit', 'oura', 'apple', 'whoop']);
+const SUPPORTED_TYPES = Object.freeze(['activity', 'sleep', 'body', 'daily']);
 
 function isNonEmptyString(v) {
   return typeof v === 'string' && v.trim().length > 0;
 }
 
-class TerraSandboxClient {
-  constructor({ clock } = {}) {
-    this._clock = typeof clock === 'function' ? clock : () => new Date().toISOString();
+function isValidTimestamp(v) {
+  if (!isNonEmptyString(v)) return false;
+  const d = new Date(v);
+  return !Number.isNaN(d.getTime());
+}
+
+class SandboxClient {
+  constructor() {
     this._connections = new Map();
   }
 
   connectUser(userId, provider) {
     if (!isNonEmptyString(userId)) {
-      throw new TypeError('userId must be a non-empty string');
+      throw new Error('connectUser: userId is required');
     }
-    if (!VALID_PROVIDERS.includes(provider)) {
-      throw new RangeError(`unsupported provider: ${provider}`);
+    if (!SUPPORTED_PROVIDERS.includes(provider)) {
+      throw new Error(`connectUser: unsupported provider "${provider}"`);
     }
-    const referenceId = crypto
-      .createHash('sha256')
-      .update(`${userId}:${provider}`)
-      .digest('hex')
-      .slice(0, 16);
     const connection = {
       userId,
       provider,
-      referenceId,
-      connectedAt: this._clock(),
-      active: true,
+      connectedAt: new Date().toISOString(),
     };
     this._connections.set(userId, connection);
     return { ...connection };
   }
 
   disconnectUser(userId) {
-    const conn = this._connections.get(userId);
-    if (!conn) return false;
-    conn.active = false;
-    conn.disconnectedAt = this._clock();
-    return true;
+    return this._connections.delete(userId);
   }
 
   isConnected(userId) {
-    const conn = this._connections.get(userId);
-    return Boolean(conn && conn.active);
+    return this._connections.has(userId);
   }
 
   getConnection(userId) {
     const conn = this._connections.get(userId);
-    return conn ? { ...conn } : null;
+    return conn ? { ...conn } : undefined;
   }
 
   listConnections() {
@@ -73,25 +54,20 @@ class TerraSandboxClient {
 
 function validateWebhookPayload(payload) {
   const errors = [];
-  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     return { valid: false, errors: ['payload must be an object'] };
   }
-  if (!isNonEmptyString(payload.type)) {
-    errors.push('type is required');
-  } else if (!VALID_WEBHOOK_TYPES.includes(payload.type)) {
-    errors.push(`unsupported type: ${payload.type}`);
+  if (!isNonEmptyString(payload.user_id)) {
+    errors.push('user_id is required');
   }
-  if (!payload.user || typeof payload.user !== 'object' || Array.isArray(payload.user)) {
-    errors.push('user object is required');
-  } else {
-    if (!isNonEmptyString(payload.user.user_id)) errors.push('user.user_id is required');
-    if (!isNonEmptyString(payload.user.provider)) errors.push('user.provider is required');
+  if (!isNonEmptyString(payload.type) || !SUPPORTED_TYPES.includes(payload.type)) {
+    errors.push(`type must be one of: ${SUPPORTED_TYPES.join(', ')}`);
   }
-  const isLifecycleType = payload.type === 'auth' || payload.type === 'deauth' || payload.type === 'user_reauth';
-  if (payload.type && !isLifecycleType && VALID_WEBHOOK_TYPES.includes(payload.type)) {
-    if (!Array.isArray(payload.data)) {
-      errors.push('data must be an array for data webhooks');
-    }
+  if (!isValidTimestamp(payload.timestamp)) {
+    errors.push('timestamp must be a valid date string');
+  }
+  if (!payload.data || typeof payload.data !== 'object' || Array.isArray(payload.data)) {
+    errors.push('data must be an object');
   }
   return { valid: errors.length === 0, errors };
 }
@@ -99,23 +75,15 @@ function validateWebhookPayload(payload) {
 function normalizeWebhookPayload(payload) {
   const { valid, errors } = validateWebhookPayload(payload);
   if (!valid) {
-    throw new Error(`invalid webhook payload: ${errors.join(', ')}`);
+    throw new Error(`Invalid webhook payload: ${errors.join('; ')}`);
   }
-  const normalized = {
+  return {
+    userId: payload.user_id.trim(),
     type: payload.type,
-    userId: payload.user.user_id,
-    provider: payload.user.provider.toUpperCase(),
-    receivedAt: payload.received_at || new Date(0).toISOString(),
-    records: [],
+    provider: isNonEmptyString(payload.provider) ? payload.provider.trim() : 'unknown',
+    timestamp: new Date(payload.timestamp).toISOString(),
+    data: { ...payload.data },
   };
-  if (Array.isArray(payload.data)) {
-    normalized.records = payload.data.map((entry, idx) => ({
-      index: idx,
-      metadata: (entry && entry.metadata) || {},
-      summary: (entry && entry.summary) || {},
-    }));
-  }
-  return normalized;
 }
 
 class EventLog {
@@ -123,17 +91,10 @@ class EventLog {
     this._events = [];
   }
 
-  log(event) {
-    if (event === null || typeof event !== 'object') {
-      throw new TypeError('event must be an object');
-    }
-    const entry = {
-      ...event,
-      loggedAt: event.loggedAt || new Date(0).toISOString(),
-      seq: this._events.length,
-    };
-    this._events.push(entry);
-    return { ...entry };
+  append(event) {
+    const stored = { ...event, loggedAt: new Date().toISOString() };
+    this._events.push(stored);
+    return { ...stored };
   }
 
   getAll() {
@@ -144,48 +105,69 @@ class EventLog {
     return this._events.length;
   }
 
+  filterByUser(userId) {
+    return this._events.filter((e) => e.userId === userId).map((e) => ({ ...e }));
+  }
+
+  filterByType(type) {
+    return this._events.filter((e) => e.type === type).map((e) => ({ ...e }));
+  }
+
+  replay(fn) {
+    this._events.forEach((e, i) => fn({ ...e }, i));
+  }
+
   clear() {
     this._events = [];
   }
-
-  replay(filter = {}) {
-    const keys = Object.keys(filter);
-    return this._events
-      .filter((e) => keys.every((key) => e[key] === filter[key]))
-      .map((e) => ({ ...e }));
-  }
 }
 
-const FIXTURES = {
-  auth: {
-    type: 'auth',
-    user: { user_id: 'user-1', provider: 'FITBIT' },
-  },
-  deauth: {
-    type: 'deauth',
-    user: { user_id: 'user-1', provider: 'FITBIT' },
-  },
-  activity: {
-    type: 'activity',
-    user: { user_id: 'user-1', provider: 'GARMIN' },
-    data: [{ metadata: { start_time: '2024-01-01T00:00:00Z' }, summary: { steps: 1000 } }],
-  },
-  sleep: {
-    type: 'sleep',
-    user: { user_id: 'user-2', provider: 'OURA' },
-    data: [
-      { metadata: { start_time: '2024-01-01T22:00:00Z' }, summary: { duration_seconds: 28800 } },
-    ],
-  },
-};
+function ingestWebhookBatch(client, log, payloads) {
+  const result = { accepted: [], rejected: [] };
+  if (!Array.isArray(payloads)) {
+    throw new Error('ingestWebhookBatch: payloads must be an array');
+  }
+  for (const payload of payloads) {
+    const { valid, errors } = validateWebhookPayload(payload);
+    if (!valid) {
+      result.rejected.push({ payload, reason: errors.join('; ') });
+      continue;
+    }
+    if (!client.isConnected(payload.user_id)) {
+      result.rejected.push({ payload, reason: `user ${payload.user_id} is not connected` });
+      continue;
+    }
+    const normalized = normalizeWebhookPayload(payload);
+    const stored = log.append(normalized);
+    result.accepted.push(stored);
+  }
+  return result;
+}
+
+function getTerraWebhookSchema() {
+  return {
+    $schema: 'http://json-schema.org/draft-07/schema#',
+    title: 'TerraWebhookPayload',
+    type: 'object',
+    required: ['user_id', 'type', 'timestamp', 'data'],
+    properties: {
+      user_id: { type: 'string', minLength: 1 },
+      type: { type: 'string', enum: [...SUPPORTED_TYPES] },
+      provider: { type: 'string', enum: [...SUPPORTED_PROVIDERS] },
+      timestamp: { type: 'string', format: 'date-time' },
+      data: { type: 'object' },
+    },
+  };
+}
 
 module.exports = {
-  VALID_PROVIDERS,
-  VALID_WEBHOOK_TYPES,
-  TerraSandboxClient,
+  SUPPORTED_PROVIDERS,
+  SUPPORTED_TYPES,
+  SandboxClient,
   validateWebhookPayload,
   normalizeWebhookPayload,
   EventLog,
-  FIXTURES,
+  ingestWebhookBatch,
+  getTerraWebhookSchema,
 };
 
