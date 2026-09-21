@@ -33,3 +33,4 @@ date	run_id	spec	change	score	prev_best	verdict
 2026-09-18	35317409232	s02	builder=failure reviewer=skipped	0	77	DISCARD
 2026-09-19	35428106979	s02	Self-contained rewrite of s02 Terra sandbox client and full jest test suite covering connect/webhook/log/batch/aggregation. 	63	77	DISCARD
 2026-09-20	35496808542	s02	Add self-contained s02 pagination and multi-provider aggregation helpers with a new additive test suite. 	104	77	KEEP
+2026-09-21	35573681783	s02	Add additive s02 exportFormat helpers (CSV/NDJSON/summary/filter/group) with a new self-contained jest suite. 	130	104	KEEP

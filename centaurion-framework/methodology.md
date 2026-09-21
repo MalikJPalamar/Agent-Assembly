@@ -48,3 +48,6 @@ CS = 0.40 x PA + 0.30 x US + 0.30 x SE
 - **35496808542 / s02 / score 104** - Add self-contained s02 pagination and multi-provider aggregation helpers with a new additive test suite. 
   - learned: Repeated full rewrites of unseen s02 files risk drift and score regressions, so purely additive, self-contained modules are safer. 
   - next: Wire the new pagination and mergeProviderPayloads helpers into the existing EventLog/sandbox client once their current implementation is visible. 
+- **35573681783 / s02 / score 130** - Add additive s02 exportFormat helpers (CSV/NDJSON/summary/filter/group) with a new self-contained jest suite. 
+  - learned: Since prior s02 index.js/pagination.js/test file contents are unseen, purely additive new modules with their own new test file avoid drift risk that caused earlier discards. 
+  - next: Once current src/s02/index.js and pagination.js contents are visible, wire exportFormat into the EventLog/sandbox client for end-to-end reporting. 
