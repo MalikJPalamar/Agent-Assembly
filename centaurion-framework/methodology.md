@@ -51,3 +51,6 @@ CS = 0.40 x PA + 0.30 x US + 0.30 x SE
 - **35573681783 / s02 / score 130** - Add additive s02 exportFormat helpers (CSV/NDJSON/summary/filter/group) with a new self-contained jest suite. 
   - learned: Since prior s02 index.js/pagination.js/test file contents are unseen, purely additive new modules with their own new test file avoid drift risk that caused earlier discards. 
   - next: Once current src/s02/index.js and pagination.js contents are visible, wire exportFormat into the EventLog/sandbox client for end-to-end reporting. 
+- **35831022301 / s02 / score 164** - Add additive s02 webhook HMAC signature verification and wearable unit normalization helpers with a new self-contained jest suite. 
+  - learned: Purely additive new modules/tests avoid drift risk from unseen existing s02 files while still growing the passing test count. 
+  - next: Once current src/s02/index.js contents are visible, wire signatureUnits.verifyWebhookSignature and normalizeReading into the sandbox client's webhook ingest path. 
