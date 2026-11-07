@@ -27,6 +27,10 @@ Add a spec by appending a row to `specs/queue.tsv` and (optionally) a `specs/<id
 
 Manual run: `gh workflow run "Centaurion Daily Builder" -R MalikJPalamar/Agent-Assembly` (optional input `spec_override=s02`).
 
+The Builder uses the **Claude Agent SDK with subscription OAuth**, not a paid API key.
+It stays blocked until paid usage credits / extra usage are confirmed disabled and a
+subscription token is authorized. See [subscription-only setup](.github/builder/README.md).
+
 ## Architecture
 
 ```
