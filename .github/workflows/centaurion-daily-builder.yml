@@ -32,7 +32,7 @@ concurrency:
 
 env:
   FRAMEWORK_DIR: centaurion-framework
-  BUILDER_MODEL: claude-sonnet-5
+  BUILDER_MODEL: sonnet
   MAX_FILES_PER_RUN: 25
 
 jobs:
@@ -46,6 +46,17 @@ jobs:
       build_branch: ${{ steps.select.outputs.build_branch }}
     steps:
       - uses: actions/checkout@v5
+
+      - name: Require subscription-only billing confirmation
+        if: github.event.inputs.mode != 'report'
+        env:
+          CLAUDE_USAGE_CREDITS_DISABLED: ${{ vars.CLAUDE_USAGE_CREDITS_DISABLED }}
+        run: |
+          set -euo pipefail
+          if [ "$CLAUDE_USAGE_CREDITS_DISABLED" != "true" ]; then
+            echo "::error::Disable paid usage credits / extra usage in Claude Settings > Usage, then set repository variable CLAUDE_USAGE_CREDITS_DISABLED=true. See .github/builder/README.md."
+            exit 1
+          fi
 
       - name: Select next spec from priority queue
         id: select
@@ -108,23 +119,33 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Check subscription credentials
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          CLAUDE_USAGE_CREDITS_DISABLED: ${{ vars.CLAUDE_USAGE_CREDITS_DISABLED }}
+        run: |
+          node --input-type=module -e "import { checkSubscription } from './.github/builder/generate.mjs'; checkSubscription(process.env);"
+
+      - name: Install pinned Claude Agent SDK and test the adapter
+        run: |
+          npm ci --prefix .github/builder --ignore-scripts --no-audit --no-fund
+          npm test --prefix .github/builder
+
       - name: Generate implementation with Claude
         id: generate
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          CLAUDE_USAGE_CREDITS_DISABLED: ${{ vars.CLAUDE_USAGE_CREDITS_DISABLED }}
           SPEC_ID: ${{ needs.architect.outputs.current_spec }}
           SPEC_TITLE: ${{ needs.architect.outputs.spec_title }}
           BUILD_BRANCH: ${{ needs.architect.outputs.build_branch }}
         run: |
           set -euo pipefail
-          if [ -z "$ANTHROPIC_API_KEY" ]; then
-            echo "::error::ANTHROPIC_API_KEY secret is not set. Run: gh secret set ANTHROPIC_API_KEY -R ${{ github.repository }}"
-            exit 1
-          fi
           echo "Building spec: $SPEC_ID on $BUILD_BRANCH"
           git checkout -b "$BUILD_BRANCH"
 
           WORK=$(mktemp -d)
+          trap 'rm -rf "$WORK"' EXIT
           SPEC_FILE="$FRAMEWORK_DIR/specs/$SPEC_ID.md"
           if [ -f "$SPEC_FILE" ]; then
             SPEC_TEXT=$(cat "$SPEC_FILE")
@@ -189,32 +210,8 @@ jobs:
           Paths must be relative, must not contain '..', and must not start with '/' or '.github/'.
           EOF
 
-          jq -n --arg model "$BUILDER_MODEL" --rawfile prompt "$WORK/prompt.txt" \
-            '{model:$model, max_tokens:16000,
-              system:"You output only valid JSON. Never wrap it in code fences.",
-              messages:[{role:"user",content:$prompt}]}' > "$WORK/request.json"
-
-          echo "Calling Anthropic Messages API ($BUILDER_MODEL)..."
-          if ! curl -sS --fail-with-body --max-time 900 https://api.anthropic.com/v1/messages \
-              -H "content-type: application/json" \
-              -H "x-api-key: $ANTHROPIC_API_KEY" \
-              -H "anthropic-version: 2023-06-01" \
-              -d @"$WORK/request.json" -o "$WORK/response.json"; then
-            echo "::error::Anthropic API request failed"
-            echo "--- response body ---"; cat "$WORK/response.json" || true; echo
-            exit 1
-          fi
-
-          STOP=$(jq -r '.stop_reason // "unknown"' "$WORK/response.json")
-          echo "stop_reason=$STOP  usage=$(jq -c '.usage' "$WORK/response.json")"
-          if [ "$STOP" = "max_tokens" ]; then
-            echo "::error::Response truncated (stop_reason=max_tokens); output would be invalid JSON"
-            exit 1
-          fi
-
-          # Concatenate text blocks, strip optional ```json fences, then parse.
-          jq -r '[.content[] | select(.type=="text") | .text] | join("")' "$WORK/response.json" \
-            | sed -e '1{/^```[a-zA-Z]*$/d;}' -e '${/^```$/d;}' > "$WORK/model.txt"
+          echo "Generating with Claude Agent SDK using subscription authentication ($BUILDER_MODEL)..."
+          node .github/builder/generate.mjs "$WORK/prompt.txt" "$WORK/model.txt"
           bash .github/scripts/apply-builder-output.sh "$WORK/model.txt" "$FRAMEWORK_DIR" "$WORK/summary.txt"
 
           SUMMARY=$(tr '\t\r\n' '   ' < "$WORK/summary.txt" | cut -c1-200)
@@ -229,7 +226,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           {
             echo "## Builder"
-            echo "- **Model:** $BUILDER_MODEL (stop_reason: $STOP)"
+            echo "- **Model:** $BUILDER_MODEL (Claude Agent SDK; subscription authentication)"
             echo "- **Summary:** $SUMMARY"
             echo "- **Files:**"
             git status --porcelain | sed 's/^/    /'
