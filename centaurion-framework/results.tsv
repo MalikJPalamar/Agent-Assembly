@@ -94,3 +94,4 @@ date	run_id	spec	change	score	prev_best	verdict
 2026-11-18	44278429221	s02	builder=failure reviewer=skipped	0	164	DISCARD
 2026-11-19	44500193096	s02	builder=failure reviewer=skipped	0	164	DISCARD
 2026-11-20	44712349473	s02	builder=failure reviewer=skipped	0	164	DISCARD
+2026-11-21	44888255141	s02	builder=failure reviewer=skipped	0	164	DISCARD
